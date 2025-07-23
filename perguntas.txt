@@ -1,0 +1,84 @@
+puxa as informações do supabase se existe > cria a thread > adiciona como ultima thread > thead id e id 
+do cliente no supabase 
+
+se não existe > cria a thread com id > cria o contato no supabase com supabase id >
+
+
+class 1 from me ?? get supa> agregator> openai assistent? > get supa >chama equipe (em que situações chama alguem da equipe e quem )
+equipe F ??
+equipe T ??
+
+
+saida para on\off ?? update supabse / chama equipe2
+no switch 6 saida para um agente > trhead ? > busca mensagem > code2 ??  > state in conversation ??? > thread assistant2 ?? > evo 
+ outra para um assistente ??? > if ??? > ler mensagem ?? 
+                                          lista mensagens ??? > redis3 >> code ??? get supa > chama equipe1
+                                                                       >> trhead user 
+                                                                      >> openai assistante?? > get supa> trhead assistant 
+                                                                                            > if2 e 4 > contem link > openai> extract file> evo
+                                                                                                                                            > escuta audio ?
+                                                                                            > if2 e 4 > digitando > evo > sheets update> update supa > get supa(cliente contador) > se não esta vazio faz update supa
+                                                                                                                                                                                  > se vazio cria supa
+                                                                                                                                                     > buscar mensagens1??> code5 > aigent 1> code 6 salva o lead score do resultado do agente > cria supa                                                    
+
+
+
+
+tool produtos ?? ELA NÃO ESTA EM FUNCIONAMENTO 
+
+tabela : tipo ?? QUAL TIPO DE COMERCIANTE ?? 
+data de cadastro ?? entrou em contato
+data da ultima alteração ?? ATUALIZAÇÃO DE CADASTRO
+ultimo assunto ?? ULTIMO ASSUNTO 
+id_ google GOOGLE CONTACT CRIA E ATUALIZA, CASO NAO EXISTA ###
+thread_id ? CONTATO CRIA E ATUALIZA, CASO NÃO EXISTA 
+follow-up data ? 
+ultimo contato ? HORARIO DE ULTIMA INTERAÇÃO
+data aniversario PEDE A DATA DE ANIVERSÁRIO DO CLIENTE
+IDIOMA ? NO AGENTE IGNORAR
+
+equipe ? TRANSFERENCIA DE ATENDIMENTO COM RESUMO  ###
+adm? FOLLOW - UP LISTA DE COISAS IMPORTANTES PARA ADM ###
+lead? QUENTE/FRIO/ MORNO
+instancia? IGNORAR
+agente? IGNORAR
+thread_ag IGNORAR 
+conciencia NIVEL DE CONSCIENCIA DO LEAD ??? ###
+ult_verifica_lead FOLLOW-UP
+verificador FOLLOW- UP
+id_kommo INCLUIR ID DO CONTATO DO KOMMO. ###
+produto de interesse ???  ###
+analise de sentimento na conversa inteira??
+
+code o que faz ? pega o payload procura por essas palavras const palavrasChave = [
+  "preço", "catálogo", "pedido", "comprar", "compra", "frete", "mesclada", "mesclado",
+  "quero", "nao fui atendida", "oi", "cnpj", "orçamento", "nao fui atendido",
+  "vou conversar com a Carol", "vou falar com a carol", "estou em nova serrana", "vendedor"
+]; se achar a palavra sai do loop, 
+Lógica:
+Se uma palavra-chave for encontrada (palavraDetectada não é null):
+Retorna um array com um único objeto, contendo:
+lead: true: Indica que a mensagem é considerada um lead (provável intenção de compra ou interação relevante).
+
+palavra_detectada: A palavra-chave encontrada.
+
+mensagens: A lista completa de mensagens.
+
+captado_por: "palavra_chave": Indica que a captura foi feita por detecção de palavra-chave.
+
+telefone: input.remoteJid || null: O número de telefone (provavelmente do WhatsApp, dado o formato @s.whatsapp.net), ou null se não estiver presente.
+
+id_cliente: ID do cliente, extraído da entrada.
+
+nome_cliente: Nome do cliente, extraído da entrada.
+
+data: Data e hora atual no formato ISO (ex.: 2025-06-26T02:03:00.000Z).
+
+Se nenhuma palavra-chave for encontrada:
+
+Retorna um array vazio ([]), indicando que não há leads a processar.
+
+Formato de saída esperado pelo n8n: O n8n espera que um Code node retorne um array de objetos, cada um com uma propriedade json. Este código segue esse padrão.
+
+
+code2 o que faz ?? 

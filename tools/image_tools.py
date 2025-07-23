@@ -1,27 +1,21 @@
 # tools/image_tools.py
-import re
-import json
-from typing import Optional
-from tenacity import retry, stop_after_attempt, wait_exponential
+import base64
 from openai import AsyncOpenAI
 from config.config import OPENAI_API_KEY
-from tools.supabase_tools import upsert_lead
-from tools.whatsapp_tools import send_whatsapp_image
 from utils.logging_setup import setup_logging
-from pydantic import BaseModel, Field
-from supabase import create_client, Client
-from config.config import SUPABASE_URL, SUPABASE_KEY
-import asyncio
-import base64
-from agents import function_tool
+from tenacity import retry, stop_after_attempt, wait_exponential
+import json
+import re
 
 logger = setup_logging()
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 async def analyze_image(content: str, mimetype: str = "image/jpeg") -> str:
+    """Analyze an image and return a description, focusing on medical documents like prescriptions."""
     logger.debug(f"Analisando imagem... (tamanho base64: {len(content)})")
     try:
+        # Ensure content is base64-encoded
         match = re.match(r"^data:image/(?P<fmt>\w+);base64,(?P<data>.+)", content)
         if match:
             mimetype = f"image/{match.group('fmt')}"
@@ -36,7 +30,7 @@ async def analyze_image(content: str, mimetype: str = "image/jpeg") -> str:
             logger.info(f"Tamanho da imagem decodificada: {len(base64.b64decode(base64_data))} bytes")
         except Exception as e:
             logger.error(f"Erro ao decodificar imagem: {e}, Base64 inicial: {base64_data[:50]}")
-            return f"Erro ao decodificar imagem: {e}"
+            return json.dumps({"is_medical_document": False, "details": f"Erro ao decodificar imagem: {str(e)}"})
 
         image_data_url = f"data:{mimetype};base64,{base64_data}"
 
@@ -46,62 +40,48 @@ async def analyze_image(content: str, mimetype: str = "image/jpeg") -> str:
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": "Descreva o produto na imagem em português do Brasil."},
-                        {"type": "image_url", "image_url": {"url": image_data_url}}
+                        {
+                            "type": "text",
+                            "text": """
+                            Analise a imagem fornecida e determine se é um documento médico, como uma prescrição, laudo ou exame. 
+                            Considere que o documento pode ser digitado ou manuscrito, com ou sem cabeçalho/logotipo, e pode incluir texto em português do Brasil.
+                            Se for um documento médico, extraia informações relevantes, como:
+                            - Nome do paciente (se visível, caso contrário, retorne 'Não identificado').
+                            - Nome do médico (se visível, com ou sem título como 'Dr.' ou 'Dra.', caso contrário, retorne 'Não identificado').
+                            - Medicamentos ou instruções (ex.: nome do medicamento, dosagem, frequência, como 'Amoxicilina 500mg, 3x/dia'; se não visível, retorne ['Não identificado']).
+                            - Data ou número do documento (se visível, formato DD/MM/AAAA ou outro; caso contrário, retorne 'Não identificado').
+                            Retorne um JSON no formato:
+                            {
+                                "is_medical_document": true,
+                                "patient_name": "Nome do paciente ou 'Não identificado'",
+                                "doctor_name": "Nome do médico ou 'Não identificado'",
+                                "medications": ["medicamento: dosagem, frequência" ou "Não identificado"],
+                                "document_date": "Data ou 'Não identificado'",
+                                "details": "Outros detalhes relevantes, como tipo de documento (ex.: prescrição, laudo)"
+                            }
+                            Se não for um documento médico, retorne:
+                            {
+                                "is_medical_document": false,
+                                "details": "Imagem não é um documento médico. Por favor, envie uma prescrição, laudo ou exame válido."
+                            }
+                            """
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": image_data_url}
+                        }
                     ]
                 }
             ],
-            temperature=0.4,
+            temperature=0.4  # Increased for better flexibility
         )
-        return response.choices[0].message.content
+        description = response.choices[0].message.content.strip()
+        logger.debug(f"Raw image analysis response: {description}")
+        try:
+            return json.dumps(json.loads(description), ensure_ascii=False)
+        except json.JSONDecodeError:
+            logger.error(f"Resposta da análise de imagem não é um JSON válido: {description}")
+            return json.dumps({"is_medical_document": False, "details": f"Erro ao processar imagem: resposta inválida"})
     except Exception as e:
-        logger.error(f"Erro ao processar imagem: {e}")
-        return f"Erro ao processar imagem: {e}"
-
-class ProductImageQuery(BaseModel):
-    product_name: str = Field(..., description="Nome do produto para buscar a imagem")
-    phone_number: str = Field(..., description="Número de telefone ou remoteJid do destinatário")
-
-@function_tool
-async def send_product_image(query: ProductImageQuery, phone_number: str, remotejid: Optional[str] = None) -> str:
-    if not all([SUPABASE_URL, SUPABASE_KEY]):
-        return json.dumps({"error": "Configurações do Supabase não estão completas"})
-    try:
-        client = create_client(SUPABASE_URL, SUPABASE_KEY)
-        loop = asyncio.get_running_loop()
-        query_lower = query.product_name.lower()
-        response = await loop.run_in_executor(None, lambda: client.table("products")
-            .select("name, size, price, image_url")
-            .ilike("name", f"%{query_lower}%")
-            .limit(1)
-            .execute())
-        if not response.data:
-            return json.dumps({"error": f"Nenhum produto encontrado para: {query.product_name}"})
-        
-        product = response.data[0]
-        if not product.get("image_url"):
-            return json.dumps({"error": f"Produto {product['name']} não tem imagem associada"})
-
-        image_url = product["image_url"]
-        if not re.match(r'^https?://', image_url):
-            logger.error(f"[{remotejid}] Formato de image_url inválido: {image_url}")
-            return json.dumps({"error": f"Formato de image_url inválido: {image_url}"})
-        
-        caption = f"{product['name']}, tamanho {product.get('size', 'N/A')}, R${product.get('price', 'N/A')}"
-        logger.debug(f"[{remotejid}] Preparando para enviar imagem, phone_number: {query.phone_number}")
-        success = await send_whatsapp_image(
-            phone_number=query.phone_number,
-            image_url=image_url,
-            caption=caption,
-            remotejid=remotejid,
-            message_key_id=None,
-            message_text=None
-        )
-        if not success:
-            logger.error(f"[{remotejid}] Falha ao enviar imagem do produto {product['name']}")
-            return json.dumps({"error": f"Falha ao enviar imagem do produto {product['name']}"})
-
-        return json.dumps({"text": ""})  # Return empty text to avoid duplicate messages
-    except Exception as e:
-        logger.error(f"[{remotejid}] Erro ao buscar ou enviar imagem do produto: {str(e)}")
-        return json.dumps({"error": f"Erro ao buscar ou enviar imagem do produto: {str(e)}"})
+        logger.error(f"Erro ao processar imagem: {str(e)}")
+        return json.dumps({"is_medical_document": False, "details": f"Erro ao processar imagem: {str(e)}"})

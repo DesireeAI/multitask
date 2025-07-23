@@ -12,7 +12,7 @@ logger = setup_logging()
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 async def extract_lead_info(message: str, remotejid: Optional[str] = None) -> str:
-    """Extract lead information from a message and return as JSON."""
+    """Extract patient information from a message and return as JSON."""
     logger.debug(f"Executing extract_lead_info for message: {message}, remotejid: {remotejid}")
     try:
         lead_data = LeadData(remotejid=remotejid)
@@ -22,7 +22,8 @@ async def extract_lead_info(message: str, remotejid: Optional[str] = None) -> st
         patterns = {
             "email": r'[\w\.-]+@[\w\.-]+\.\w+',
             "cep": r'\d{5}-?\d{3}',  # Accepts both xxxxx-xxx and xxxxxxxx
-            "data_aniversario": r'\b(\d{2}/\d{2}/\d{4})\b'
+            "data_nascimento": r'\b(\d{2}/\d{2}/\d{4})\b',
+            "cpf_cnpj": r'\b(\d{3}\.\d{3}\.\d{3}-\d{2}|\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})\b'
         }
 
         # Extract structured fields
@@ -51,13 +52,7 @@ async def extract_lead_info(message: str, remotejid: Optional[str] = None) -> st
         except Exception as e:
             logger.error(f"[{remotejid}] Erro ao detectar idioma: {str(e)}")
 
-        # Map merchant type using OpenAI
-        merchant_types = {
-            "lojista": ["tenho loja", "sou lojista", "dono de loja", "tenho comércio", "sou comerciante", "gerencio uma loja", "minha loja"],
-            "revendedor": ["faço revenda", "sou revendedor", "revendo produtos", "sou vendedor", "vendo no atacado"],
-            "sacoleiro": ["vendo em casa", "sou sacoleiro", "vendo de porta em porta", "vendo por conta própria"],
-            "feirante": ["sou feirante", "vendo na feira", "tenho barraca", "trabalho na feira", "vendo no mercado"]
-        }
+        # Detect symptoms using OpenAI
         try:
             response = await client.chat.completions.create(
                 model="gpt-4o-mini",
@@ -65,27 +60,22 @@ async def extract_lead_info(message: str, remotejid: Optional[str] = None) -> st
                     {
                         "role": "user",
                         "content": f"""
-                        Analise a mensagem: '{message}'. 
-                        Determine se o usuário mencionou ser um tipo de comerciante (lojista, revendedor, sacoleiro, feirante).
-                        Exemplos:
-                        - "tenho loja" → lojista
-                        - "faço revenda" → revendedor
-                        - "vendo em casa" → sacoleiro
-                        - "vendo na feira" → feirante
-                        Retorne apenas o tipo de comerciante (ex.: 'lojista') ou 'nenhum' se não for mencionado.
+                        Analise a mensagem: '{message}'.
+                        Identifique quaisquer sintomas mencionados (ex.: dor de ouvido, zumbido, dificuldade para respirar).
+                        Retorne apenas os sintomas identificados (ex.: 'dor de ouvido') ou 'nenhum' se não houver menção.
                         """
                     }
                 ],
                 temperature=0.2
             )
-            tipo = response.choices[0].message.content.strip()
-            if tipo != "nenhum":
-                extracted_data["tipo"] = tipo
-                lead_data.tipo = tipo
+            sintomas = response.choices[0].message.content.strip()
+            if sintomas != "nenhum":
+                extracted_data["sintomas"] = sintomas
+                lead_data.sintomas = sintomas
         except Exception as e:
-            logger.error(f"[{remotejid}] Erro ao detectar tipo de comerciante: {str(e)}")
+            logger.error(f"[{remotejid}] Erro ao detectar sintomas: {str(e)}")
 
-        # Detect sentiment using OpenAI
+        # Detect consultation type using OpenAI
         try:
             response = await client.chat.completions.create(
                 model="gpt-4o-mini",
@@ -93,32 +83,58 @@ async def extract_lead_info(message: str, remotejid: Optional[str] = None) -> st
                     {
                         "role": "user",
                         "content": f"""
-                        Analise o sentimento da mensagem: '{message}'.
-                        Determine se o sentimento é positivo, negativo ou neutro.
+                        Analise a mensagem: '{message}'.
+                        Determine o tipo de consulta desejada (ex.: otorrino, fonoaudiologia, exame).
                         Exemplos:
-                        - "Adorei os tênis!" → positivo
-                        - "Não recebi meu pedido!" → negativo
-                        - "Quero ver o catálogo" → neutro
-                        Retorne apenas o sentimento (ex.: 'positivo', 'negativo', 'neutro').
+                        - "Quero marcar uma consulta" → otorrino
+                        - "Preciso de um exame auditivo" → exame
+                        - "Quero uma consulta com fonoaudiólogo" → fonoaudiologia
+                        Retorne apenas o tipo de consulta (ex.: 'otorrino') ou 'nenhum' se não for mencionado.
                         """
                     }
                 ],
                 temperature=0.2
             )
-            sentimento = response.choices[0].message.content.strip()
-            if sentimento in ["positivo", "negativo", "neutro"]:
-                extracted_data["sentimento"] = sentimento
-                lead_data.sentimento = sentimento
+            consulta_type = response.choices[0].message.content.strip()
+            if consulta_type != "nenhum":
+                extracted_data["consulta_type"] = consulta_type
+                lead_data.consulta_type = consulta_type
         except Exception as e:
-            logger.error(f"[{remotejid}] Erro ao detectar sentimento: {str(e)}")
+            logger.error(f"[{remotejid}] Erro ao detectar tipo de consulta: {str(e)}")
 
-        # Extract cidade and estado
+        # Detect médico using OpenAI
+        try:
+            response = await client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": f"""
+                        Analise a mensagem: '{message}'.
+                        Identifique o nome do médico mencionado, se houver (ex.: 'Dr. João', 'Dra. Maria').
+                        Retorne apenas o nome do médico (ex.: 'Dr. João') ou 'nenhum' se não for mencionado.
+                        """
+                    }
+                ],
+                temperature=0.2
+            )
+            medico = response.choices[0].message.content.strip()
+            if medico != "nenhum":
+                extracted_data["medico"] = medico
+                lead_data.medico = medico
+        except Exception as e:
+            logger.error(f"[{remotejid}] Erro ao detectar médico: {str(e)}")
+
+        # Extract cidade, estado, and nome_cliente
         if "cidade:" in message.lower():
             extracted_data["cidade"] = message.lower().split("cidade:")[1].strip().split()[0]
             lead_data.cidade = extracted_data["cidade"]
         if "estado:" in message.lower():
             extracted_data["estado"] = message.lower().split("estado:")[1].strip().split()[0]
             lead_data.estado = extracted_data["estado"]
+        if "nome:" in message.lower():
+            extracted_data["nome_cliente"] = message.lower().split("nome:")[1].strip().capitalize()
+            lead_data.nome_cliente = extracted_data["nome_cliente"]
 
         # Update ult_contato
         extracted_data["ult_contato"] = datetime.now().isoformat()
