@@ -22,6 +22,22 @@ class LeadDataInput(BaseModel):
     idioma: Optional[str] = None
     ult_contato: Optional[str] = None
     pushname: Optional[str] = None
+    data_nascimento: Optional[str] = None
+    klingo_client_id: Optional[str] = None
+    klingo_access_key: Optional[str] = None
+    cidade: Optional[str] = None
+    estado: Optional[str] = None
+    email: Optional[str] = None
+    followup: Optional[bool] = None
+    followup_data: Optional[str] = None
+    cep: Optional[str] = None
+    endereco: Optional[str] = None
+    lead: Optional[int] = None
+    verificador: Optional[int] = None
+    payment_status: Optional[str] = None
+    consulta_type: Optional[str] = None
+    medico: Optional[str] = None
+    sintomas: Optional[str] = None
 
 async def upsert_lead(remotejid: str, data: LeadData) -> Dict:
     if not all([SUPABASE_URL, SUPABASE_KEY]):
@@ -58,9 +74,7 @@ async def get_lead(remotejid: str) -> Dict:
     try:
         client = create_client(SUPABASE_URL, SUPABASE_KEY)
         loop = asyncio.get_running_loop()
-        response = await loop.run_in_executor(None, lambda: client.table("clients").select(
-            "nome_cliente,telefone,cpf_cnpj,asaas_customer_id,thread_id,data_cadastro,idioma,ult_contato,pushname"
-        ).eq("remotejid", remotejid).execute())
+        response = await loop.run_in_executor(None, lambda: client.table("clients").select("*").eq("remotejid", remotejid).execute())
         lead_data = response.data[0] if response.data else {}
         logger.debug(f"Retrieved lead for remotejid {remotejid}: {lead_data}")
         return lead_data
@@ -91,6 +105,6 @@ async def get_lead_agent(remotejid: str) -> Dict:
         remotejid (str): The WhatsApp user ID (e.g., '558496248451@s.whatsapp.net').
 
     Returns:
-        Dict: Lead data including 'nome_cliente', 'telefone', 'cpf_cnpj', 'asaas_customer_id', etc., or empty dict if not found.
+        Dict: Lead data including all fields from the clients table, or empty dict if not found.
     """
     return await get_lead(remotejid)

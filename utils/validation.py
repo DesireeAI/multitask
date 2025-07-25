@@ -5,12 +5,22 @@ from utils.logging_setup import setup_logging
 logger = setup_logging()
 
 def validate_lead_data(data: Dict) -> Dict:
+    """
+    Validate and filter lead data to ensure only valid columns are included.
+
+    Args:
+        data (Dict): The lead data to validate.
+
+    Returns:
+        Dict: Filtered dictionary containing only valid columns.
+    """
     lead_schema = {
         "remotejid", "nome_cliente", "pushname", "telefone", "cidade", "estado",
         "email", "data_nascimento", "idioma", "thread_id", "data_cadastro", 
         "data_ultima_alteracao", "followup", "followup_data", "ult_contato",
         "cep", "endereco", "lead", "verificador", "cpf_cnpj",
-        "asaas_customer_id", "payment_status", "consulta_type", "medico"
+        "asaas_customer_id", "payment_status", "consulta_type", "medico",
+        "klingo_client_id", "klingo_access_key", "sintomas"
     }
     valid_data = {k: v for k, v in data.items() if k in lead_schema and v is not None}
     

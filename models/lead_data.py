@@ -3,6 +3,7 @@ from pydantic import BaseModel, Field
 from typing import Optional
 
 class LeadData(BaseModel):
+    remotejid: str = Field(..., description="WhatsApp user ID (e.g., '558496248451@s.whatsapp.net')")
     nome_cliente: Optional[str] = Field(None, description="Nome completo do cliente")
     pushname: Optional[str] = Field(None, description="PushName do WhatsApp")
     telefone: Optional[str] = Field(None, description="Número de telefone ou WhatsApp")
@@ -10,7 +11,7 @@ class LeadData(BaseModel):
     cidade: Optional[str] = Field(None, description="Cidade do cliente")
     estado: Optional[str] = Field(None, description="Estado do cliente")
     email: Optional[str] = Field(None, description="Endereço de e-mail do cliente")
-    data_nascimento: Optional[str] = Field(None, description="Data de nascimento do cliente (DD/MM/AAAA)")
+    data_nascimento: Optional[str] = Field(None, description="Data de nascimento do cliente (YYYY-MM-DD)")
     thread_id: Optional[str] = Field(None, description="Thread ID for conversation tracking")
     data_cadastro: Optional[str] = Field(None, description="Data de cadastro do lead")
     data_ultima_alteracao: Optional[str] = Field(None, description="Data da última alteração")
@@ -29,4 +30,3 @@ class LeadData(BaseModel):
     medico: Optional[str] = Field(None, description="Nome do médico para a consulta")
     cpf_cnpj: Optional[str] = Field(None, description="CPF ou CNPJ do cliente")
     sintomas: Optional[str] = Field(None, description="Sintomas mencionados pelo paciente (ex.: dor de ouvido, zumbido)")
-    scheduling_metadata: Optional[dict] = None
