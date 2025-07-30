@@ -12,13 +12,14 @@ from tools.extract_lead_info import extract_lead_info
 from utils.image_processing import resize_image_to_thumbnail
 from models.lead_data import LeadData
 from bot_agents.triage_agent import triage_agent
+from bot_agents.appointment_agent import start_appointment_reminder
 from agents import Runner
 from utils.logging_setup import setup_logging
 from datetime import datetime
 import os
 import base64
 from tools.asaas_tools import _get_customer_by_cpf, _create_customer, _create_payment_link
-from tools.klingo_tools import fetch_klingo_schedule, identify_klingo_patient, register_klingo_patient
+from tools.klingo_tools import fetch_klingo_schedule, identify_klingo_patient, register_klingo_patient, fetch_procedure_price
 from typing import Optional
 
 logger = setup_logging()
@@ -37,12 +38,13 @@ def build_response_data(text: str, metadata: dict, intent: str = "scheduling") -
         "name": metadata.get("name"),
         "birth_date": metadata.get("birth_date"),
         "cpf": metadata.get("cpf"),
-        "access_token": metadata.get("access_token")
+        "access_token": metadata.get("access_token"),
+        "clinic_id": metadata.get("clinic_id")  # Added clinic_id
     }
     base_metadata.update({k: v for k, v in metadata.items() if v is not None})
     return {"text": text, "metadata": base_metadata}
 
-async def get_or_create_thread(user_id: str, push_name: Optional[str] = None) -> str:
+async def get_or_create_thread(user_id: str, push_name: Optional[str] = None, clinic_id: str = None) -> str:
     if not user_id or user_id == "unknown" or "@s.whatsapp.net" not in user_id:
         logger.error(f"Invalid user_id: {user_id}")
         raise ValueError("Invalid user_id")
@@ -60,7 +62,8 @@ async def get_or_create_thread(user_id: str, push_name: Optional[str] = None) ->
                 pushname=push_name,
                 telefone=user_id.replace("@s.whatsapp.net", ""),
                 data_cadastro=lead.get("data_cadastro", datetime.now().isoformat()),
-                thread_id=lead["thread_id"]
+                thread_id=lead["thread_id"],
+                clinic_id=clinic_id  # Added clinic_id
             )
             logger.debug(f"Updating nome_cliente and pushname for {user_id}: {push_name}")
             await upsert_lead(user_id, lead_data)
@@ -74,7 +77,8 @@ async def get_or_create_thread(user_id: str, push_name: Optional[str] = None) ->
         pushname=push_name,
         telefone=user_id.replace("@s.whatsapp.net", ""),
         data_cadastro=datetime.now().isoformat(),
-        thread_id=thread.id
+        thread_id=thread.id,
+        clinic_id=clinic_id  # Added clinic_id
     )
     logger.debug(f"Preparing to upsert lead data: {lead_data.dict(exclude_unset=True)}")
     await upsert_lead(user_id, lead_data)
@@ -93,11 +97,26 @@ async def get_thread_history(thread_id: str, limit: int = 10) -> str:
         logger.error(f"Error retrieving thread history for thread {thread_id}: {str(e)}")
         return "Error retrieving conversation history."
 
+@app.on_event("startup")
+async def startup_event():
+    await start_appointment_reminder()
+
 @app.post("/webhook")
 async def webhook(request: Request):
     try:
         data = await request.json()
         logger.info(f"Payload recebido: {data}")
+
+        # Identify clinic from WhatsApp number
+        recipient_number = data.get("data", {}).get("key", {}).get("participant", "") or data.get("data", {}).get("key", {}).get("remoteJid", "")
+        client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        response = await client.table("whatsapp_numbers").select("clinic_id").eq("phone_number", recipient_number).execute()
+        if not response.data:
+            logger.error(f"No clinic found for phone number: {recipient_number}")
+            return {"status": "error", "message": "Clinic not found"}
+        clinic_id = response.data[0]["clinic_id"]
+        # Set clinic_id for RLS
+        await client.rpc("set_current_clinic_id", {"clinic_id": clinic_id}).execute()
         
         user_id = data.get("data", {}).get("key", {}).get("remoteJid", "")
         phone_number = user_id
@@ -119,7 +138,7 @@ async def webhook(request: Request):
             logger.error(f"[{user_id}] Invalid remotejid format for Klingo phone derivation: {klingo_phone}")
             klingo_phone = None
 
-        thread_id = await get_or_create_thread(user_id, push_name=push_name)
+        thread_id = await get_or_create_thread(user_id, push_name=push_name, clinic_id=clinic_id)
         thread_history = await get_thread_history(thread_id)
         logger.debug(f"Thread history for {thread_id}: {thread_history}")
 
@@ -128,7 +147,7 @@ async def webhook(request: Request):
         is_audio_message = False
         is_image_message = False
         message_key_id = data.get("data", {}).get("key", {}).get("id", "")
-        response_data = {"text": "Desculpe, houve um problema ao processar sua mensagem. Como posso ajudar?", "metadata": {"intent": "error"}}
+        response_data = {"text": "Desculpe, houve um problema ao processar sua mensagem. Como posso ajudar?", "metadata": {"intent": "error", "clinic_id": clinic_id}}
 
         if message_data.get("conversation"):
             message = message_data["conversation"]
@@ -141,7 +160,7 @@ async def webhook(request: Request):
             media_result = await fetch_media_base64(message_key_id, "audio", remotejid=user_id)
             if "error" in media_result:
                 logger.error(f"[{user_id}] Falha ao processar áudio: {media_result['error']}")
-                response_data = {"text": f"Falha ao processar áudio: {media_result['error']}", "metadata": {"intent": "error"}}
+                response_data = {"text": f"Falha ao processar áudio: {media_result['error']}", "metadata": {"intent": "error", "clinic_id": clinic_id}}
             elif media_result.get("type") == "audio":
                 message = media_result["transcription"]
                 logger.info(f"Transcribed audio to: {message}")
@@ -153,7 +172,7 @@ async def webhook(request: Request):
                 media_result = await fetch_media_base64(message_key_id, "image", remotejid=user_id)
                 if "error" in media_result:
                     logger.error(f"[{user_id}] Falha ao buscar imagem completa: {media_result['error']}")
-                    response_data = {"text": f"Falha ao buscar imagem completa: {media_result['error']}", "metadata": {"intent": "error"}}
+                    response_data = {"text": f"Falha ao buscar imagem completa: {media_result['error']}", "metadata": {"intent": "error", "clinic_id": clinic_id}}
                 elif media_result.get("type") == "image":
                     base64_data = media_result["base64"]
                     mimetype = media_result["mimetype"]
@@ -162,13 +181,13 @@ async def webhook(request: Request):
                     resized_base64 = await resize_image_to_thumbnail(decoded_data, max_size=512)
                     if not resized_base64:
                         logger.error(f"[{user_id}] Falha ao redimensionar imagem")
-                        response_data = {"text": "Falha ao redimensionar imagem. Por favor, envie outra imagem ou descreva sua solicitação.", "metadata": {"intent": "error"}}
+                        response_data = {"text": "Falha ao redimensionar imagem. Por favor, envie outra imagem ou descreva sua solicitação.", "metadata": {"intent": "error", "clinic_id": clinic_id}}
                     else:
                         image_description = await analyze_image(content=resized_base64, mimetype=mimetype)
                         try:
                             image_data = json.loads(image_description)
                             if image_data.get("is_medical_document"):
-                                lead_data = LeadData(remotejid=user_id)
+                                lead_data = LeadData(remotejid=user_id, clinic_id=clinic_id)
                                 if image_data.get("patient_name") != "Não identificado":
                                     lead_data.nome_cliente = image_data["patient_name"]
                                 if image_data.get("doctor_name") != "Não identificado":
@@ -195,18 +214,17 @@ async def webhook(request: Request):
                         logger.info(f"[{user_id}] Imagem analisada, mensagem gerada: {message}")
             except Exception as e:
                 logger.error(f"[{user_id}] Erro ao processar imagem: {str(e)}")
-                response_data = {"text": f"Erro ao processar imagem: {str(e)}", "metadata": {"intent": "error"}}
+                response_data = {"text": f"Erro ao processar imagem: {str(e)}", "metadata": {"intent": "error", "clinic_id": clinic_id}}
 
-        if message and not is_audio_message and not is_image_message:
+        if message:
             try:
-                full_message = f"Histórico da conversa:\n{thread_history}\n\nNova mensagem: {message}\nPhone: {klingo_phone}"
+                full_message = f"Histórico da conversa:\n{thread_history}\n\nNova mensagem: {message}\nPhone: {klingo_phone}\nClinicID: {clinic_id}"
                 await client.beta.threads.messages.create(
                     thread_id=thread_id,
                     role="user",
                     content=message
                 )
-                logger.debug(f"Added user message to thread {thread_id}: {message}")
-                logger.debug(f"[{user_id}] triage_agent type: {type(triage_agent)}, has name: {hasattr(triage_agent, 'name')}")
+                logger.debug(f"[{user_id}] Added user message to thread {thread_id}: {message}")
                 logger.debug(f"[{user_id}] Calling triage_agent with input: {full_message}, user_id: {user_id}, phone_number: {klingo_phone}")
                 response = await Runner.run(triage_agent, input=full_message)
                 logger.debug(f"[{user_id}] Raw RunResult: {response}")
@@ -220,23 +238,25 @@ async def webhook(request: Request):
                         logger.warning(f"[{user_id}] Agent response is JSON but not a dict: {response_data}")
                         response_data = build_response_data(
                             text=str(response_data),
-                            metadata={"intent": "error", "phone_number": klingo_phone},
+                            metadata={"intent": "error", "phone_number": klingo_phone, "clinic_id": clinic_id},
                             intent="error"
                         )
                 except json.JSONDecodeError:
                     logger.warning(f"[{user_id}] Resposta não é um JSON válido, tratando como texto puro: {response_data}")
                     response_data = build_response_data(
                         text=response_data,
-                        metadata={"intent": "error", "phone_number": klingo_phone},
+                        metadata={"intent": "error", "phone_number": klingo_phone, "clinic_id": clinic_id},
                         intent="error"
                     )
 
-                # Use agent's metadata directly, add phone_number if missing
+                # Use agent's metadata directly, add phone_number and clinic_id if missing
                 if "phone_number" not in response_data.get("metadata", {}):
                     response_data["metadata"]["phone_number"] = klingo_phone
+                if "clinic_id" not in response_data.get("metadata", {}):
+                    response_data["metadata"]["clinic_id"] = clinic_id
 
                 # Update lead_data based on metadata
-                lead_data = LeadData(remotejid=user_id, telefone=klingo_phone)
+                lead_data = LeadData(remotejid=user_id, telefone=klingo_phone, clinic_id=clinic_id)
                 if response_data.get("metadata", {}).get("name"):
                     lead_data.nome_cliente = response_data["metadata"]["name"]
                 if response_data.get("metadata", {}).get("birth_date"):
@@ -255,15 +275,15 @@ async def webhook(request: Request):
                     cpf_cnpj = response_data["metadata"].get("cpf")
                     if cpf_cnpj:
                         try:
-                            nome_cliente = user_provided_name or lead_data.nome_cliente or push_name or "Cliente OtorrinoMed"
-                            customer_data = await _get_customer_by_cpf(cpf_cnpj, user_id)
+                            nome_cliente = user_provided_name or lead_data.nome_cliente or push_name or "Cliente"
+                            customer_data = await _get_customer_by_cpf(cpf_cnpj, user_id, clinic_id)
                             customer_json = json.loads(customer_data)
                             if customer_json.get("data") and len(customer_json["data"]) > 0:
                                 customer_id = customer_json["data"][0]["id"]
                                 logger.info(f"[{user_id}] Customer found: {customer_id}")
                             else:
                                 logger.info(f"[{user_id}] No customer found, creating new customer for CPF {cpf_cnpj}")
-                                customer_result = await _create_customer(cpf_cnpj, nome_cliente, None, klingo_phone or phone_number.replace("@s.whatsapp.net", ""), user_id)
+                                customer_result = await _create_customer(cpf_cnpj, nome_cliente, None, klingo_phone or phone_number.replace("@s.whatsapp.net", ""), user_id, clinic_id)
                                 customer_json = json.loads(customer_result)
                                 if "id" in customer_json:
                                     customer_id = customer_json["id"]
@@ -272,13 +292,26 @@ async def webhook(request: Request):
                                     logger.error(f"[{user_id}] Failed to create customer: {customer_json}")
                                     response_data = build_response_data(
                                         text="Erro ao criar cliente no Asaas. Por favor, tente novamente ou contate o suporte: wa.me/5537987654321.",
-                                        metadata={"intent": "error", "phone_number": klingo_phone},
+                                        metadata={"intent": "error", "phone_number": klingo_phone, "clinic_id": clinic_id},
                                         intent="error"
                                     )
                                     await send_whatsapp_message(phone_number, response_data["text"], remotejid=user_id)
                                     return {"status": "error", "message": "Failed to create customer"}
 
-                            payment_result = await _create_payment_link(customer_id, 300.00, "Consulta OtorrinoMed", user_id)
+                            # Fetch dynamic price
+                            amount = await fetch_procedure_price(
+                                id_plano=response_data["metadata"].get("plano", 1),
+                                id_medico=response_data["metadata"].get("doctor_id"),
+                                clinic_id=clinic_id,
+                                remotejid=user_id
+                            )
+                            payment_result = await _create_payment_link(
+                                customer_id=customer_id,
+                                amount=amount,
+                                description=f"Consulta com {response_data['metadata'].get('doctor_name', 'Médico')} em {response_data['metadata'].get('selected_date', 'Data')}",
+                                remotejid=user_id,
+                                clinic_id=clinic_id
+                            )
                             payment_json = json.loads(payment_result)
                             if "invoiceUrl" in payment_json:
                                 response_data = build_response_data(
@@ -288,18 +321,23 @@ async def webhook(request: Request):
                                         "step": "payment_link_sent",
                                         "phone_number": klingo_phone,
                                         "register_id": response_data["metadata"].get("register_id"),
-                                        "access_token": response_data["metadata"].get("access_token")
+                                        "access_token": response_data["metadata"].get("access_token"),
+                                        "customer_id": customer_id,
+                                        "payment_status": payment_json.get("status"),
+                                        "invoice_url": payment_json["invoiceUrl"],
+                                        "clinic_id": clinic_id
                                     },
                                     intent="payment"
                                 )
                                 lead_data.cpf_cnpj = cpf_cnpj
                                 lead_data.asaas_customer_id = customer_id
+                                lead_data.payment_status = payment_json.get("status")
                                 await upsert_lead(user_id, lead_data)
                             else:
                                 logger.error(f"[{user_id}] Failed to create payment link: {payment_json}")
                                 response_data = build_response_data(
                                     text="Erro ao criar link de pagamento. Por favor, tente novamente ou contate o suporte: wa.me/5537987654321.",
-                                    metadata={"intent": "error", "phone_number": klingo_phone},
+                                    metadata={"intent": "error", "phone_number": klingo_phone, "clinic_id": clinic_id},
                                     intent="error"
                                 )
 
@@ -307,15 +345,16 @@ async def webhook(request: Request):
                             logger.error(f"[{user_id}] Erro ao processar CPF {cpf_cnpj}: {str(e)}")
                             response_data = build_response_data(
                                 text="Erro ao processar seu CPF. Por favor, tente novamente ou contate o suporte: wa.me/5537987654321.",
-                                metadata={"intent": "error", "phone_number": klingo_phone},
+                                metadata={"intent": "error", "phone_number": klingo_phone, "clinic_id": clinic_id},
                                 intent="error"
                             )
 
+                # Lead extraction
                 try:
                     extracted_info = await extract_lead_info(message, remotejid=user_id)
                     extracted_data = json.loads(extracted_info)
                     if "error" not in extracted_data:
-                        lead_data = LeadData(**extracted_data)
+                        lead_data = LeadData(**extracted_data, clinic_id=clinic_id)
                         if user_provided_name:
                             lead_data.nome_cliente = user_provided_name
                         await upsert_lead(user_id, lead_data)
@@ -327,7 +366,7 @@ async def webhook(request: Request):
                 logger.error(f"[{user_id}] Failed to process message in thread {thread_id}: {str(e)}")
                 response_data = build_response_data(
                     text=f"Erro ao processar mensagem: {str(e)}. Por favor, tente novamente ou contate o suporte: wa.me/5537987654321.",
-                    metadata={"intent": "error", "phone_number": klingo_phone},
+                    metadata={"intent": "error", "phone_number": klingo_phone, "clinic_id": clinic_id},
                     intent="error"
                 )
 
@@ -349,7 +388,7 @@ async def webhook(request: Request):
                 logger.error(f"Failed to generate audio: {audio_path}")
                 response_data = build_response_data(
                     text="Desculpe, houve um problema ao gerar o áudio. Como posso ajudar?",
-                    metadata={"intent": "error", "phone_number": klingo_phone},
+                    metadata={"intent": "error", "phone_number": klingo_phone, "clinic_id": clinic_id},
                     intent="error"
                 )
                 success = await send_whatsapp_message(phone_number, response_data["text"], remotejid=user_id)
@@ -373,7 +412,7 @@ async def webhook(request: Request):
                         logger.error(f"[{user_id}] Falha ao enviar imagem: {image_url}")
                         response_data = build_response_data(
                             text="Desculpe, houve um problema ao enviar a imagem.",
-                            metadata={"intent": "error", "phone_number": klingo_phone},
+                            metadata={"intent": "error", "phone_number": klingo_phone, "clinic_id": clinic_id},
                             intent="error"
                         )
                 if response_data.get("text"):
@@ -393,7 +432,7 @@ async def webhook(request: Request):
             logger.error(f"Failed to add assistant response to thread {thread_id}: {str(e)}")
             response_data = build_response_data(
                 text=f"Erro ao salvar resposta do assistente: {str(e)}. Por favor, tente novamente ou contate o suporte: wa.me/5537987654321.",
-                metadata={"intent": "error", "phone_number": klingo_phone},
+                metadata={"intent": "error", "phone_number": klingo_phone, "clinic_id": clinic_id},
                 intent="error"
             )
             success = await send_whatsapp_message(phone_number, response_data["text"], remotejid=user_id)

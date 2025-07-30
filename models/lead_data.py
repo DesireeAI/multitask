@@ -30,3 +30,5 @@ class LeadData(BaseModel):
     medico: Optional[str] = Field(None, description="Nome do médico para a consulta")
     cpf_cnpj: Optional[str] = Field(None, description="CPF ou CNPJ do cliente")
     sintomas: Optional[str] = Field(None, description="Sintomas mencionados pelo paciente (ex.: dor de ouvido, zumbido)")
+    clinic_id: Optional[str] = Field(None, description="ID da clínica")
+    appointment_id: Optional[str] = None
