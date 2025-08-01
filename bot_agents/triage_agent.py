@@ -17,7 +17,7 @@ from tools.klingo_tools import (
 )
 from bot_agents.support_agent import support_agent
 from utils.logging_setup import setup_logging
-from models.lead_data import LeadDataInput
+from models.lead_data import LeadData
 
 logger = setup_logging()
 

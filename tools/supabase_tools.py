@@ -1,8 +1,6 @@
-# tools/supabase_tools.py
 from typing import Dict, Optional
 from datetime import datetime
-import asyncio
-from supabase import create_client, Client
+from supabase import acreate_client, AsyncClient  # Changed to acreate_client and AsyncClient
 from config.config import SUPABASE_URL, SUPABASE_KEY
 from models.lead_data import LeadData
 from utils.validation import validate_lead_data
@@ -39,19 +37,10 @@ class LeadDataInput(BaseModel):
     consulta_type: Optional[str] = None
     medico: Optional[str] = None
     sintomas: Optional[str] = None
-    clinic_id: Optional[str] = None  # Added clinic_id
+    clinic_id: Optional[str] = None
     appointment_id: Optional[str] = None
 
 async def upsert_lead(remotejid: str, data: LeadData, clinic_id: str = None) -> Dict:
-    """
-    Upsert lead data into the clients table in Supabase.
-    Args:
-        remotejid (str): The WhatsApp user ID (e.g., '558496248451@s.whatsapp.net').
-        data (LeadData): Lead data object to upsert.
-        clinic_id (str, optional): The ID of the clinic.
-    Returns:
-        Dict: The upserted lead data or empty dict on error.
-    """
     if not all([SUPABASE_URL, SUPABASE_KEY]):
         logger.error(f"[{remotejid}] Configurações do Supabase não estão completas")
         return {}
@@ -59,24 +48,22 @@ async def upsert_lead(remotejid: str, data: LeadData, clinic_id: str = None) -> 
         logger.error(f"[{remotejid}] Invalid remotejid for upsert: {remotejid}")
         return {}
     try:
-        client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        client: AsyncClient = await acreate_client(SUPABASE_URL, SUPABASE_KEY)  # Use acreate_client
         valid_data = validate_lead_data(data.dict(exclude_unset=True))
         valid_data["remotejid"] = remotejid
         valid_data["data_ultima_alteracao"] = datetime.now().isoformat()
         if clinic_id:
             try:
-                uuid.UUID(clinic_id)  # Validate clinic_id as UUID
+                uuid.UUID(clinic_id)
                 valid_data["clinic_id"] = clinic_id
             except ValueError:
                 logger.error(f"[{remotejid}] Invalid clinic_id format: {clinic_id}")
                 return {}
         logger.debug(f"[{remotejid}] Upserting lead data for remotejid {remotejid}: {valid_data}")
-        loop = asyncio.get_running_loop()
-        response = await loop.run_in_executor(None, lambda: client.table("clients").upsert(
-            valid_data,
-            on_conflict="remotejid",
-            returning="representation"
-        ).execute())
+        response = await client.table("clients").upsert(
+            valid_data, on_conflict="remotejid", returning="representation"
+        ).execute()
+        logger.debug(f"[{remotejid}] Upsert response: {response}, type: {type(response)}")
         logger.info(f"[{remotejid}] Upserted lead for remotejid: {remotejid}, data: {valid_data}")
         return response.data[0] if response.data else {}
     except Exception as e:
@@ -84,13 +71,6 @@ async def upsert_lead(remotejid: str, data: LeadData, clinic_id: str = None) -> 
         return {}
 
 async def get_lead(remotejid: str) -> Dict:
-    """
-    Retrieve lead data from Supabase.
-    Args:
-        remotejid (str): The WhatsApp user ID (e.g., '558496248451@s.whatsapp.net').
-    Returns:
-        Dict: Lead data including all fields from the clients table, or empty dict if not found.
-    """
     if not all([SUPABASE_URL, SUPABASE_KEY]):
         logger.error(f"[{remotejid}] Configurações do Supabase não estão completas")
         return {}
@@ -98,24 +78,23 @@ async def get_lead(remotejid: str) -> Dict:
         logger.error(f"[{remotejid}] Invalid remotejid for get_lead: {remotejid}")
         return {}
     try:
-        client = create_client(SUPABASE_URL, SUPABASE_KEY)
-        loop = asyncio.get_running_loop()
-        response = await loop.run_in_executor(None, lambda: client.table("clients").select("*").eq("remotejid", remotejid).execute())
+        client: AsyncClient = await acreate_client(SUPABASE_URL, SUPABASE_KEY)  # Use acreate_client
+        response = await client.table("clients").select("*").eq("remotejid", remotejid).execute()
+        logger.debug(f"[{remotejid}] Get response: {response}, type: {type(response)}")
         lead_data = response.data[0] if response.data else {}
         logger.debug(f"[{remotejid}] Retrieved lead for remotejid {remotejid}: {lead_data}")
         return lead_data
     except Exception as e:
         logger.error(f"[{remotejid}] Error retrieving lead for remotejid {remotejid}: {e}")
         return {}
+
 @function_tool
 async def upsert_lead_agent(remotejid: str, data: LeadDataInput = None) -> Dict:
     """
     Upsert lead data into Supabase for agent use.
-
     Args:
         remotejid (str): The WhatsApp user ID (e.g., '558496248451@s.whatsapp.net').
         data (LeadDataInput, optional): Lead data to upsert, including 'nome_cliente', 'telefone', 'cpf_cnpj', etc.
-
     Returns:
         Dict: The upserted lead data or empty dict on error.
     """
@@ -125,10 +104,8 @@ async def upsert_lead_agent(remotejid: str, data: LeadDataInput = None) -> Dict:
 async def get_lead_agent(remotejid: str) -> Dict:
     """
     Retrieve lead data from Supabase for agent use.
-
     Args:
         remotejid (str): The WhatsApp user ID (e.g., '558496248451@s.whatsapp.net').
-
     Returns:
         Dict: Lead data including all fields from the clients table, or empty dict if not found.
     """

@@ -3,7 +3,7 @@ import json
 import re
 from openai import AsyncOpenAI
 from config.config import OPENAI_API_KEY, SUPABASE_URL, SUPABASE_KEY
-from supabase import create_client, Client
+from supabase import create_client, Client, AsyncClient, acreate_client
 from tools.supabase_tools import get_lead, upsert_lead
 from tools.whatsapp_tools import send_whatsapp_message, send_whatsapp_audio, send_whatsapp_image, fetch_media_base64
 from tools.audio_tools import text_to_speech
@@ -18,12 +18,13 @@ from utils.logging_setup import setup_logging
 from datetime import datetime
 import os
 import base64
-from tools.asaas_tools import _get_customer_by_cpf, _create_customer, _create_payment_link
+from tools.asaas_tools import get_customer_by_cpf, create_customer, create_payment_link
 from tools.klingo_tools import fetch_klingo_schedule, identify_klingo_patient, register_klingo_patient, fetch_procedure_price
 from typing import Optional
+import asyncio
 
 logger = setup_logging()
-client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+client = AsyncOpenAI(api_key=OPENAI_API_KEY)  # OpenAI client
 app = FastAPI()
 threads = {}
 
@@ -39,7 +40,7 @@ def build_response_data(text: str, metadata: dict, intent: str = "scheduling") -
         "birth_date": metadata.get("birth_date"),
         "cpf": metadata.get("cpf"),
         "access_token": metadata.get("access_token"),
-        "clinic_id": metadata.get("clinic_id")  # Added clinic_id
+        "clinic_id": metadata.get("clinic_id")
     }
     base_metadata.update({k: v for k, v in metadata.items() if v is not None})
     return {"text": text, "metadata": base_metadata}
@@ -63,12 +64,12 @@ async def get_or_create_thread(user_id: str, push_name: Optional[str] = None, cl
                 telefone=user_id.replace("@s.whatsapp.net", ""),
                 data_cadastro=lead.get("data_cadastro", datetime.now().isoformat()),
                 thread_id=lead["thread_id"],
-                clinic_id=clinic_id  # Added clinic_id
+                clinic_id=clinic_id
             )
             logger.debug(f"Updating nome_cliente and pushname for {user_id}: {push_name}")
             await upsert_lead(user_id, lead_data)
         return lead["thread_id"]
-    thread = await client.beta.threads.create()
+    thread = await client.beta.threads.create()  # Using OpenAI client
     threads[user_id] = thread.id
     logger.debug(f"Created new thread for user {user_id}: {thread.id}")
     lead_data = LeadData(
@@ -78,7 +79,7 @@ async def get_or_create_thread(user_id: str, push_name: Optional[str] = None, cl
         telefone=user_id.replace("@s.whatsapp.net", ""),
         data_cadastro=datetime.now().isoformat(),
         thread_id=thread.id,
-        clinic_id=clinic_id  # Added clinic_id
+        clinic_id=clinic_id
     )
     logger.debug(f"Preparing to upsert lead data: {lead_data.dict(exclude_unset=True)}")
     await upsert_lead(user_id, lead_data)
@@ -86,7 +87,7 @@ async def get_or_create_thread(user_id: str, push_name: Optional[str] = None, cl
 
 async def get_thread_history(thread_id: str, limit: int = 10) -> str:
     try:
-        messages = await client.beta.threads.messages.list(thread_id=thread_id, limit=limit)
+        messages = await client.beta.threads.messages.list(thread_id=thread_id, limit=limit)  # Using OpenAI client
         history = []
         for msg in reversed(messages.data):
             role = msg.role
@@ -99,7 +100,8 @@ async def get_thread_history(thread_id: str, limit: int = 10) -> str:
 
 @app.on_event("startup")
 async def startup_event():
-    await start_appointment_reminder()
+    logger.info("Disparando tarefa de lembrete de agendamentos...")
+    asyncio.create_task(start_appointment_reminder())
 
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -107,17 +109,28 @@ async def webhook(request: Request):
         data = await request.json()
         logger.info(f"Payload recebido: {data}")
 
-        # Identify clinic from WhatsApp number
-        recipient_number = data.get("data", {}).get("key", {}).get("participant", "") or data.get("data", {}).get("key", {}).get("remoteJid", "")
-        client = create_client(SUPABASE_URL, SUPABASE_KEY)
-        response = await client.table("whatsapp_numbers").select("clinic_id").eq("phone_number", recipient_number).execute()
+        sender_number = data.get("sender", "")
+        if not sender_number or "@s.whatsapp.net" not in sender_number:
+            logger.error(f"Invalid sender number: {sender_number}")
+            return {"status": "error", "message": "Invalid sender number"}
+
+        # Criar cliente Supabase assíncrono
+        supabase_client: AsyncClient = await acreate_client(SUPABASE_URL, SUPABASE_KEY)  # Renamed to supabase_client
+        response = await supabase_client.table("whatsapp_numbers").select("clinic_id").eq("phone_number", sender_number).execute()
         if not response.data:
-            logger.error(f"No clinic found for phone number: {recipient_number}")
+            logger.error(f"No clinic found for phone number: {sender_number}")
             return {"status": "error", "message": "Clinic not found"}
         clinic_id = response.data[0]["clinic_id"]
+        logger.info(f"Clinic found: {clinic_id} for sender number: {sender_number}")
+
         # Set clinic_id for RLS
-        await client.rpc("set_current_clinic_id", {"clinic_id": clinic_id}).execute()
-        
+        try:
+            rpc_response = await supabase_client.rpc("set_current_clinic_id", {"clinic_id": clinic_id}).execute()
+            logger.debug(f"RPC response: {rpc_response}, type: {type(rpc_response)}")
+        except Exception as e:
+            logger.error(f"Error in RPC call: {str(e)}")
+            return {"status": "error", "message": f"Error setting clinic_id: {str(e)}"}
+
         user_id = data.get("data", {}).get("key", {}).get("remoteJid", "")
         phone_number = user_id
         push_name = data.get("data", {}).get("pushName", None)
@@ -219,7 +232,7 @@ async def webhook(request: Request):
         if message:
             try:
                 full_message = f"Histórico da conversa:\n{thread_history}\n\nNova mensagem: {message}\nPhone: {klingo_phone}\nClinicID: {clinic_id}"
-                await client.beta.threads.messages.create(
+                await client.beta.threads.messages.create(  # Using OpenAI client
                     thread_id=thread_id,
                     role="user",
                     content=message
@@ -249,13 +262,11 @@ async def webhook(request: Request):
                         intent="error"
                     )
 
-                # Use agent's metadata directly, add phone_number and clinic_id if missing
                 if "phone_number" not in response_data.get("metadata", {}):
                     response_data["metadata"]["phone_number"] = klingo_phone
                 if "clinic_id" not in response_data.get("metadata", {}):
                     response_data["metadata"]["clinic_id"] = clinic_id
 
-                # Update lead_data based on metadata
                 lead_data = LeadData(remotejid=user_id, telefone=klingo_phone, clinic_id=clinic_id)
                 if response_data.get("metadata", {}).get("name"):
                     lead_data.nome_cliente = response_data["metadata"]["name"]
@@ -270,7 +281,6 @@ async def webhook(request: Request):
                     logger.debug(f"[{user_id}] Updating lead data: {lead_data.dict(exclude_unset=True)}")
                     await upsert_lead(user_id, lead_data)
 
-                # Handle payment flow for Asaas
                 if response_data.get("metadata", {}).get("intent") == "payment" and response_data.get("metadata", {}).get("step") == "process_payment":
                     cpf_cnpj = response_data["metadata"].get("cpf")
                     if cpf_cnpj:
@@ -298,7 +308,6 @@ async def webhook(request: Request):
                                     await send_whatsapp_message(phone_number, response_data["text"], remotejid=user_id)
                                     return {"status": "error", "message": "Failed to create customer"}
 
-                            # Fetch dynamic price
                             amount = await fetch_procedure_price(
                                 id_plano=response_data["metadata"].get("plano", 1),
                                 id_medico=response_data["metadata"].get("doctor_id"),
@@ -337,7 +346,7 @@ async def webhook(request: Request):
                                 logger.error(f"[{user_id}] Failed to create payment link: {payment_json}")
                                 response_data = build_response_data(
                                     text="Erro ao criar link de pagamento. Por favor, tente novamente ou contate o suporte: wa.me/5537987654321.",
-                                    metadata={"intent": "error", "phone_number": klingo_phone, "clinic_id": clinic_id},
+                                    metadata={"intent": "error", "phone_number": kinklingo_phonego_phone, "clinic_id": clinic_id},
                                     intent="error"
                                 )
 
@@ -349,7 +358,6 @@ async def webhook(request: Request):
                                 intent="error"
                             )
 
-                # Lead extraction
                 try:
                     extracted_info = await extract_lead_info(message, remotejid=user_id)
                     extracted_data = json.loads(extracted_info)
@@ -422,7 +430,7 @@ async def webhook(request: Request):
 
         try:
             if response_data.get("text"):
-                await client.beta.threads.messages.create(
+                await client.beta.threads.messages.create(  # Using OpenAI client
                     thread_id=thread_id,
                     role="assistant",
                     content=response_data["text"]

@@ -1,11 +1,10 @@
-# tools/klingo_tools.py
 from agents import function_tool
 import httpx
 import json
 from datetime import datetime, timedelta
 from utils.logging_setup import setup_logging
 from config.config import SUPABASE_URL, SUPABASE_KEY
-from supabase import create_client
+from supabase import acreate_client, AsyncClient  # Changed to acreate_client and AsyncClient
 from typing import Optional
 
 logger = setup_logging()
@@ -18,7 +17,7 @@ async def _get_klingo_app_token(clinic_id: str, remotejid: str) -> str:
         logger.error(f"[{remotejid}] Configurações do Supabase não estão completas")
         return ""
     try:
-        client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        client: AsyncClient = await acreate_client(SUPABASE_URL, SUPABASE_KEY)  # Use acreate_client
         response = await client.table("clinics").select("klingo_app_token").eq("clinic_id", clinic_id).execute()
         if response.data and len(response.data) > 0:
             token = response.data[0]["klingo_app_token"]
@@ -113,10 +112,10 @@ async def fetch_klingo_schedule(
                     {
                         "slot_id": slot_id,
                         "time": time,
-                        "datetime": f"{horario['data']}T{time}:00"  # ISO format for appointment_datetime
+                        "datetime": f"{horario['data']}T{time}:00"
                     }
                     for slot_id, time in horario["horarios"].items()
-                ][:3]  # Limit to 3 times
+                ][:3]
                 formatted_schedules.append({
                     "doctor_id": str(horario["profissional"]["id"]),
                     "doctor_name": horario["profissional"]["nome"],
@@ -180,18 +179,6 @@ async def book_klingo_appointment(
 ) -> str:
     """
     Book an appointment in Klingo for a patient using the provided slot_id and access_token.
-    Args:
-        access_token (str): The patient's access token from login_klingo_patient or identify_klingo_patient.
-        slot_id (str): The ID of the selected time slot (e.g., '2025-07-31|5|3315|1|13:00').
-        doctor_id (str): The ID of the doctor (e.g., '5').
-        doctor_name (str): The name of the doctor (e.g., 'Dr Carlos Borba').
-        doctor_number (int): The doctor's number (e.g., 17137).
-        email (str, optional): The patient's email for confirmation.
-        remotejid (str, optional): The WhatsApp user ID for logging context.
-        clinic_id (str, optional): The ID of the clinic.
-        exame (int, optional): The consultation procedure ID (default: 1376).
-    Returns:
-        str: JSON string with appointment details, including appointment_datetime, or error message.
     """
     logger.info(f"[{remotejid}] Calling book_klingo_appointment with slot_id: {slot_id}, doctor_id: {doctor_id}, clinic_id: {clinic_id}, exame: {exame}")
     if not access_token or not slot_id or not doctor_id or not doctor_name or not doctor_number:
@@ -199,9 +186,8 @@ async def book_klingo_appointment(
         return json.dumps({"error": "Parâmetros obrigatórios ausentes"})
 
     try:
-        # Extract datetime from slot_id (format: 'YYYY-MM-DD|...|HH:MM')
         appointment_datetime = slot_id.split("|")[0] + "T" + slot_id.split("|")[-1] + ":00"
-        datetime.fromisoformat(appointment_datetime)  # Validate format
+        datetime.fromisoformat(appointment_datetime)
     except (IndexError, ValueError):
         logger.error(f"[{remotejid}] Invalid slot_id format: {slot_id}")
         return json.dumps({"error": "Formato de slot_id inválido"})
@@ -220,7 +206,7 @@ async def book_klingo_appointment(
             "uf": "BA",
             "numero": doctor_number,
             "nome": doctor_name,
-            "cbos": "225275"  # Should match especialidade from fetch_klingo_schedule
+            "cbos": "225275"
         },
         "confirmado": "confirmed",
         "id_externo": "22838",
@@ -266,18 +252,10 @@ async def book_klingo_appointment(
         logger.error(f"[{remotejid}] {error_message}")
         return json.dumps({"error": error_message})
 
-
 @function_tool
 async def identify_klingo_patient(phone_number: str, birth_date: str = "", remotejid: str = None, clinic_id: str = None) -> str:
     """
     Identify a patient in Klingo using phone number and optional birth date.
-    Args:
-        phone_number (str): The patient's phone number (e.g., '84992101119').
-        birth_date (str, optional): The patient's birth date (format YYYY-MM-DD, e.g., '1989-10-10').
-        remotejid (str, optional): The WhatsApp user ID for logging context.
-        clinic_id (str, optional): The ID of the clinic.
-    Returns:
-        str: JSON string with patient data or error message.
     """
     klingo_app_token = await _get_klingo_app_token(clinic_id, remotejid)
     if not klingo_app_token:
@@ -350,16 +328,6 @@ async def identify_klingo_patient(phone_number: str, birth_date: str = "", remot
 async def register_klingo_patient(name: str, gender: str, birth_date: str, phone_number: str, email: str = "", remotejid: str = None, clinic_id: str = None) -> str:
     """
     Register a new patient in Klingo using provided details.
-    Args:
-        name (str): Full name of the patient.
-        gender (str): Gender of the patient ('M' or 'F').
-        birth_date (str): Birth date in YYYY-MM-DD format.
-        phone_number (str): Phone number of the patient.
-        email (str, optional): Email address of the patient.
-        remotejid (str, optional): WhatsApp user ID for logging context.
-        clinic_id (str, optional): The ID of the clinic.
-    Returns:
-        str: JSON string with register_id or error message.
     """
     klingo_app_token = await _get_klingo_app_token(clinic_id, remotejid)
     if not klingo_app_token:
@@ -433,12 +401,6 @@ async def register_klingo_patient(name: str, gender: str, birth_date: str, phone
 async def login_klingo_patient(register_id: str, remotejid: str = None, clinic_id: str = None) -> str:
     """
     Authenticate a patient in Klingo using their register_id.
-    Args:
-        register_id (str): The register_id returned from register_klingo_patient.
-        remotejid (str, optional): WhatsApp user ID for logging context.
-        clinic_id (str, optional): The ID of the clinic.
-    Returns:
-        str: JSON string with access_token, token_type, and register_id or error message.
     """
     klingo_app_token = await _get_klingo_app_token(clinic_id, remotejid)
     if not klingo_app_token:
@@ -492,86 +454,6 @@ async def login_klingo_patient(register_id: str, remotejid: str = None, clinic_i
         return json.dumps({"error": error_message})
 
 @function_tool
-async def book_klingo_appointment(access_token: str, slot_id: str, doctor_id: str, doctor_name: str, doctor_number: int, email: str = "", remotejid: str = None, clinic_id: str = None) -> str:
-    """
-    Book an appointment in Klingo for a patient using the provided slot_id and access_token.
-    Args:
-        access_token (str): The patient's access token from login_klingo_patient or identify_klingo_patient.
-        slot_id (str): The ID of the selected time slot (e.g., '2025-07-31|5|3315|1|13:00').
-        doctor_id (str): The ID of the doctor (e.g., '5').
-        doctor_name (str): The name of the doctor (e.g., 'Dr Carlos Borba').
-        doctor_number (int): The doctor's number (e.g., 17137).
-        email (str, optional): The patient's email for confirmation.
-        remotejid (str, optional): The WhatsApp user ID for logging context.
-        clinic_id (str, optional): The ID of the clinic.
-    Returns:
-        str: JSON string with appointment details or error message.
-    """
-    logger.info(f"[{remotejid}] Calling book_klingo_appointment with slot_id: {slot_id}, doctor_id: {doctor_id}, clinic_id: {clinic_id}")
-    if not access_token or not slot_id or not doctor_id or not doctor_name or not doctor_number:
-        logger.error(f"[{remotejid}] Parâmetros obrigatórios ausentes: access_token={access_token}, slot_id={slot_id}, doctor_id={doctor_id}, doctor_name={doctor_name}, doctor_number={doctor_number}")
-        return json.dumps({"error": "Parâmetros obrigatórios ausentes"})
-
-    payload = {
-        "procedimento": "1376",
-        "id": slot_id,
-        "email": bool(email),
-        "teleatendimento": False,
-        "revisao": False,
-        "remarcacao": "",
-        "ordem_chegada": False,
-        "lista": [123],
-        "solicitante": {
-            "conselho": "CRM",
-            "uf": "BA",
-            "numero": doctor_number,
-            "nome": doctor_name,
-            "cbos": "225275"
-        },
-        "confirmado": "confirmed",
-        "id_externo": "22838",
-        "obs": "agendado pelo agente de IA - teste",
-        "duracao": 10,
-        "id_ampliar": 0
-    }
-
-    logger.debug(f"[{remotejid}] Enviando solicitação para Klingo API: URL=https://api-externa.klingo.app/api/agenda/horario, Payload={json.dumps(payload, ensure_ascii=False)}")
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                "https://api-externa.klingo.app/api/agenda/horario",
-                json=payload,
-                headers={
-                    "accept": "application/json",
-                    "Authorization": f"Bearer {access_token}",
-                    "Content-Type": "application/json"
-                },
-                timeout=30
-            )
-            response.raise_for_status()
-            data = response.json()
-            logger.debug(f"[{remotejid}] Resposta da Klingo API: Status={response.status_code}, Body={json.dumps(data, ensure_ascii=False)}")
-            
-            return json.dumps({
-                "status": "success",
-                "appointment_id": data.get("id", ""),
-                "doctor_name": doctor_name,
-                "slot_id": slot_id,
-                "message": "Agendamento realizado com sucesso"
-            })
-
-    except httpx.HTTPStatusError as e:
-        status_code = e.response.status_code
-        error_detail = e.response.text
-        error_message = f"Erro HTTP: {status_code} - {error_detail}"
-        logger.error(f"[{remotejid}] {error_message}")
-        return json.dumps({"error": error_message})
-    except Exception as e:
-        error_message = f"Erro ao realizar agendamento: {str(e)}"
-        logger.error(f"[{remotejid}] {error_message}")
-        return json.dumps({"error": error_message})
-
-@function_tool
 async def fetch_procedure_price(
     id_plano: int,
     id_medico: Optional[int] = None,
@@ -581,16 +463,8 @@ async def fetch_procedure_price(
 ) -> float:
     """
     Fetch procedure price from Klingo API.
-    Args:
-        id_plano (int): The plan ID (e.g., 1).
-        id_medico (int, optional): The doctor ID.
-        id_unidade (int, optional): The unit ID.
-        clinic_id (str, optional): The clinic ID to fetch klingo_app_token.
-        remotejid (str, optional): The WhatsApp user ID for logging.
-    Returns:
-        float: The procedure price or 300.0 if not found.
     """
-    client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    client: AsyncClient = await acreate_client(SUPABASE_URL, SUPABASE_KEY)  # Use acreate_client
     response = await client.table("clinics").select("klingo_app_token").eq("clinic_id", clinic_id).execute()
     if not response.data:
         logger.error(f"[{remotejid}] No klingo_app_token found for clinic_id: {clinic_id}")
@@ -632,11 +506,6 @@ async def fetch_procedure_price(
 async def fetch_klingo_specialties(clinic_id: str, remotejid: str) -> str:
     """
     Fetch available specialties from Klingo API.
-    Args:
-        clinic_id (str): The clinic ID to fetch klingo_app_token.
-        remotejid (str): The WhatsApp user ID for logging.
-    Returns:
-        str: JSON string with specialties or error message.
     """
     klingo_app_token = await _get_klingo_app_token(clinic_id, remotejid)
     if not klingo_app_token:
@@ -667,11 +536,6 @@ async def fetch_klingo_specialties(clinic_id: str, remotejid: str) -> str:
 async def fetch_klingo_convenios(clinic_id: str, remotejid: str) -> str:
     """
     Fetch available health plans (convênios) from Klingo API.
-    Args:
-        clinic_id (str): The clinic ID to fetch klingo_app_token.
-        remotejid (str): The WhatsApp user ID for logging.
-    Returns:
-        str: JSON string with convênios or error message.
     """
     klingo_app_token = await _get_klingo_app_token(clinic_id, remotejid)
     if not klingo_app_token:
@@ -702,12 +566,6 @@ async def fetch_klingo_convenios(clinic_id: str, remotejid: str) -> str:
 async def fetch_klingo_consultas(clinic_id: str, remotejid: str, especialidade: str = None) -> str:
     """
     Fetch available consultation procedures from Klingo API.
-    Args:
-        clinic_id (str): The clinic ID to fetch klingo_app_token.
-        remotejid (str): The WhatsApp user ID for logging.
-        especialidade (str, optional): The specialty code (e.g., '225275').
-    Returns:
-        str: JSON string with consultations or error message.
     """
     klingo_app_token = await _get_klingo_app_token(clinic_id, remotejid)
     if not klingo_app_token:
