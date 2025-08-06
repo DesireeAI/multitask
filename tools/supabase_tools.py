@@ -110,3 +110,33 @@ async def get_lead_agent(remotejid: str) -> Dict:
         Dict: Lead data including all fields from the clients table, or empty dict if not found.
     """
     return await get_lead(remotejid)
+
+async def get_clinic_config(clinic_id: str) -> Dict:
+    """
+    Retrieve clinic configuration from Supabase.
+    Args:
+        clinic_id (str): UUID of the clinic.
+    Returns:
+        Dict: Clinic configuration including name, assistant_name, address, and recommendations.
+    """
+    try:
+        client: AsyncClient = await acreate_client(SUPABASE_URL, SUPABASE_KEY)
+        response = await client.table("clinics").select("name, assistant_name, address, recommendations").eq("clinic_id", clinic_id).execute()
+        logger.debug(f"[{clinic_id}] Clinic config response: {response}")
+        if response.data:
+            return response.data[0]
+        logger.warning(f"No config found for clinic_id {clinic_id}")
+        return {
+            "name": "Clínica Padrão",
+            "assistant_name": "Assistente",
+            "address": "Endereço não informado",
+            "recommendations": "Nenhuma recomendação específica."
+        }
+    except Exception as e:
+        logger.error(f"Error fetching clinic config for clinic_id {clinic_id}: {str(e)}")
+        return {
+            "name": "Clínica Padrão",
+            "assistant_name": "Assistente",
+            "address": "Endereço não informado",
+            "recommendations": "Nenhuma recomendação específica."
+        }

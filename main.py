@@ -11,7 +11,7 @@ from tools.image_tools import analyze_image
 from tools.extract_lead_info import extract_lead_info
 from utils.image_processing import resize_image_to_thumbnail
 from models.lead_data import LeadData
-from bot_agents.triage_agent import triage_agent
+from bot_agents.triage_agent import initialize_triage_agent
 from bot_agents.appointment_agent import start_appointment_reminder
 from agents import Runner
 from utils.logging_setup import setup_logging
@@ -122,6 +122,9 @@ async def webhook(request: Request):
             return {"status": "error", "message": "Clinic not found"}
         clinic_id = response.data[0]["clinic_id"]
         logger.info(f"Clinic found: {clinic_id} for sender number: {sender_number}")
+
+        # Inicializar o triage_agent com base no clinic_id
+        triage_agent_instance = await initialize_triage_agent(clinic_id)
 
         # Set clinic_id for RLS
         try:
@@ -239,7 +242,7 @@ async def webhook(request: Request):
                 )
                 logger.debug(f"[{user_id}] Added user message to thread {thread_id}: {message}")
                 logger.debug(f"[{user_id}] Calling triage_agent with input: {full_message}, user_id: {user_id}, phone_number: {klingo_phone}")
-                response = await Runner.run(triage_agent, input=full_message)
+                response = await Runner.run(triage_agent_instance, input=full_message)
                 logger.debug(f"[{user_id}] Raw RunResult: {response}")
                 response_data = str(response.final_output)
                 logger.info(f"[{user_id}] Raw agent response (final_output): {response_data}")
@@ -286,14 +289,14 @@ async def webhook(request: Request):
                     if cpf_cnpj:
                         try:
                             nome_cliente = user_provided_name or lead_data.nome_cliente or push_name or "Cliente"
-                            customer_data = await _get_customer_by_cpf(cpf_cnpj, user_id, clinic_id)
+                            customer_data = await get_customer_by_cpf(cpf_cnpj, user_id, clinic_id)
                             customer_json = json.loads(customer_data)
                             if customer_json.get("data") and len(customer_json["data"]) > 0:
                                 customer_id = customer_json["data"][0]["id"]
                                 logger.info(f"[{user_id}] Customer found: {customer_id}")
                             else:
                                 logger.info(f"[{user_id}] No customer found, creating new customer for CPF {cpf_cnpj}")
-                                customer_result = await _create_customer(cpf_cnpj, nome_cliente, None, klingo_phone or phone_number.replace("@s.whatsapp.net", ""), user_id, clinic_id)
+                                customer_result = await create_customer(cpf_cnpj, nome_cliente, None, klingo_phone or phone_number.replace("@s.whatsapp.net", ""), user_id, clinic_id)
                                 customer_json = json.loads(customer_result)
                                 if "id" in customer_json:
                                     customer_id = customer_json["id"]
@@ -301,7 +304,7 @@ async def webhook(request: Request):
                                 else:
                                     logger.error(f"[{user_id}] Failed to create customer: {customer_json}")
                                     response_data = build_response_data(
-                                        text="Erro ao criar cliente no Asaas. Por favor, tente novamente ou contate o suporte: wa.me/5537987654321.",
+                                        text="Erro ao criar cliente no Asaas. Por favor, tente novamente ou contate o suporte.",
                                         metadata={"intent": "error", "phone_number": klingo_phone, "clinic_id": clinic_id},
                                         intent="error"
                                     )
@@ -314,7 +317,7 @@ async def webhook(request: Request):
                                 clinic_id=clinic_id,
                                 remotejid=user_id
                             )
-                            payment_result = await _create_payment_link(
+                            payment_result = await create_payment_link(
                                 customer_id=customer_id,
                                 amount=amount,
                                 description=f"Consulta com {response_data['metadata'].get('doctor_name', 'Médico')} em {response_data['metadata'].get('selected_date', 'Data')}",
@@ -345,15 +348,15 @@ async def webhook(request: Request):
                             else:
                                 logger.error(f"[{user_id}] Failed to create payment link: {payment_json}")
                                 response_data = build_response_data(
-                                    text="Erro ao criar link de pagamento. Por favor, tente novamente ou contate o suporte: wa.me/5537987654321.",
-                                    metadata={"intent": "error", "phone_number": kinklingo_phonego_phone, "clinic_id": clinic_id},
+                                    text="Erro ao criar link de pagamento. Por favor, tente novamente ou contate o suporte.",
+                                    metadata={"intent": "error", "phone_number": klingo_phone, "clinic_id": clinic_id},
                                     intent="error"
                                 )
 
                         except Exception as e:
                             logger.error(f"[{user_id}] Erro ao processar CPF {cpf_cnpj}: {str(e)}")
                             response_data = build_response_data(
-                                text="Erro ao processar seu CPF. Por favor, tente novamente ou contate o suporte: wa.me/5537987654321.",
+                                text="Erro ao processar seu CPF. Por favor, tente novamente ou contate o suporte.",
                                 metadata={"intent": "error", "phone_number": klingo_phone, "clinic_id": clinic_id},
                                 intent="error"
                             )
@@ -373,7 +376,7 @@ async def webhook(request: Request):
             except Exception as e:
                 logger.error(f"[{user_id}] Failed to process message in thread {thread_id}: {str(e)}")
                 response_data = build_response_data(
-                    text=f"Erro ao processar mensagem: {str(e)}. Por favor, tente novamente ou contate o suporte: wa.me/5537987654321.",
+                    text=f"Erro ao processar mensagem: {str(e)}. Por favor, tente novamente ou contate o suporte.",
                     metadata={"intent": "error", "phone_number": klingo_phone, "clinic_id": clinic_id},
                     intent="error"
                 )
@@ -439,7 +442,7 @@ async def webhook(request: Request):
         except Exception as e:
             logger.error(f"Failed to add assistant response to thread {thread_id}: {str(e)}")
             response_data = build_response_data(
-                text=f"Erro ao salvar resposta do assistente: {str(e)}. Por favor, tente novamente ou contate o suporte: wa.me/5537987654321.",
+                text=f"Erro ao salvar resposta do assistente: {str(e)}. Por favor, tente novamente ou contate o suporte.",
                 metadata={"intent": "error", "phone_number": klingo_phone, "clinic_id": clinic_id},
                 intent="error"
             )

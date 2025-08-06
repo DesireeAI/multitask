@@ -1,4 +1,3 @@
-# tools/extract_lead_info.py
 import re
 import json
 from typing import Dict, Optional
@@ -33,6 +32,15 @@ async def extract_lead_info(message: str, remotejid: Optional[str] = None, pushN
         if metadata.get("gender"):
             lead_data.gender = metadata["gender"].upper()
             extracted_data["gender"] = lead_data.gender
+        if metadata.get("doctor_name"):  # Safe handling of doctor_name
+            lead_data.medico = metadata["doctor_name"]
+            extracted_data["medico"] = lead_data.medico
+        if metadata.get("appointment_datetime"):
+            lead_data.data_horario = metadata["appointment_datetime"]
+            extracted_data["data_horario"] = lead_data.data_horario
+        if metadata.get("especialidade"):
+            lead_data.consulta_type = "otorrino" if "otorrino" in metadata["especialidade"].lower() else "fonoaudiologia"
+            extracted_data["consulta_type"] = lead_data.consulta_type
 
         # Regex patterns for structured fields
         patterns = {
