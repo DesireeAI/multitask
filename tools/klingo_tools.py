@@ -595,3 +595,39 @@ async def fetch_klingo_consultas(clinic_id: str, remotejid: str, especialidade: 
     except Exception as e:
         logger.error(f"[{remotejid}] Error fetching consultas: {str(e)}")
         return json.dumps({"error": f"Erro: {str(e)}"})
+
+@function_tool
+async def fetch_klingo_profissionais(clinic_id: str, remotejid: str, especialidade: str = None) -> str:
+    """
+    Fetch available professionals from Klingo API based on the provided clinic_id and optional especialidade.
+    The especialidade parameter should be provided by the agent when the user's desired specialty is identified.
+    Returns a JSON string containing the list of professionals.
+    """
+    klingo_app_token = await _get_klingo_app_token(clinic_id, remotejid)
+    if not klingo_app_token:
+        return json.dumps({"error": "Não foi possível obter o token da API Klingo"})
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            params = {}
+            if especialidade:
+                params["especialidade"] = especialidade
+            response = await client.get(
+                "https://api-externa.klingo.app/api/profissionais",
+                params=params,
+                headers={
+                    "accept": "application/json",
+                    "X-APP-TOKEN": klingo_app_token
+                },
+                timeout=30
+            )
+            response.raise_for_status()
+            data = response.json()
+            logger.debug(f"[{remotejid}] Fetched profissionais: {data}")
+            return json.dumps(data)
+    except httpx.HTTPStatusError as e:
+        logger.error(f"[{remotejid}] HTTP error fetching profissionais: {e.response.status_code}")
+        return json.dumps({"error": f"Erro HTTP: {e.response.status_code}"})
+    except Exception as e:
+        logger.error(f"[{remotejid}] Error fetching profissionais: {str(e)}")
+        return json.dumps({"error": f"Erro: {str(e)}"})

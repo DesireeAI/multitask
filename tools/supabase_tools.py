@@ -8,6 +8,7 @@ from utils.logging_setup import setup_logging
 from pydantic import BaseModel
 from agents import function_tool
 import uuid
+from typing import Dict
 
 logger = setup_logging()
 
@@ -113,30 +114,70 @@ async def get_lead_agent(remotejid: str) -> Dict:
 
 async def get_clinic_config(clinic_id: str) -> Dict:
     """
-    Retrieve clinic configuration from Supabase.
+    Retrieve clinic configuration and agent prompts from Supabase.
     Args:
         clinic_id (str): UUID of the clinic.
     Returns:
-        Dict: Clinic configuration including name, assistant_name, address, and recommendations.
+        Dict: Clinic configuration including name, assistant_name, address, recommendations, support_phone,
+              and agent prompts (triage_agent, initial_message, offered_services).
     """
     try:
         client: AsyncClient = await acreate_client(SUPABASE_URL, SUPABASE_KEY)
-        response = await client.table("clinics").select("name, assistant_name, address, recommendations").eq("clinic_id", clinic_id).execute()
-        logger.debug(f"[{clinic_id}] Clinic config response: {response}")
-        if response.data:
-            return response.data[0]
-        logger.warning(f"No config found for clinic_id {clinic_id}")
-        return {
+        
+        # Buscar configurações da clínica
+        clinic_response = await client.table("clinics").select(
+            "name, assistant_name, address, recommendations, support_phone"
+        ).eq("clinic_id", clinic_id).execute()
+        
+        # Buscar prompts relevantes
+        prompts_response = await client.table("agent_prompts").select(
+            "name, prompt, variables, enabled"
+        ).eq("clinic_id", clinic_id).in_("name", ["Triage Agent", "Initial Message", "Offered Services"]).execute()
+        
+        logger.debug(f"[{clinic_id}] Clinic config response: {clinic_response}")
+        logger.debug(f"[{clinic_id}] Agent prompts response: {prompts_response}")
+        
+        # Configurações padrão
+        config = {
             "name": "Clínica Padrão",
             "assistant_name": "Assistente",
             "address": "Endereço não informado",
-            "recommendations": "Nenhuma recomendação específica."
+            "recommendations": "Nenhuma recomendação específica.",
+            "support_phone": "Não informado",
+            "prompts": {
+                "triage_agent": {
+                    "prompt": "Atenda o cliente {client_name} e identifique a intenção (agendamento, pagamento, dúvida).",
+                    "variables": ["{client_name}"],
+                    "enabled": True
+                },
+                "initial_message": {
+                    "prompt": "Bem-vindo(a) ao {clinic_name}, {client_name}! {greeting} Como posso ajudar você hoje?",
+                    "variables": ["{clinic_name}", "{client_name}", "{greeting}"],
+                    "enabled": True
+                },
+                "offered_services": {
+                    "prompt": "Nossos serviços incluem: {service_list}. Deseja mais informações?",
+                    "variables": ["{service_list}"],
+                    "enabled": True
+                }
+            }
         }
+        
+        # Atualizar com dados da clínica
+        if clinic_response.data:
+            config.update(clinic_response.data[0])
+        
+        # Atualizar com prompts personalizados
+        if prompts_response.data:
+            for prompt_data in prompts_response.data:
+                agent_key = prompt_data["name"].lower().replace(" ", "_")
+                config["prompts"][agent_key] = {
+                    "prompt": prompt_data["prompt"],
+                    "variables": prompt_data["variables"],
+                    "enabled": prompt_data["enabled"]
+                }
+        
+        return config
     except Exception as e:
         logger.error(f"Error fetching clinic config for clinic_id {clinic_id}: {str(e)}")
-        return {
-            "name": "Clínica Padrão",
-            "assistant_name": "Assistente",
-            "address": "Endereço não informado",
-            "recommendations": "Nenhuma recomendação específica."
-        }
+        return config

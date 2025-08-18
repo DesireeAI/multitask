@@ -1,10 +1,9 @@
-# utils/logging_setup.py
 import logging
 
 def setup_logging():
     # Configurar o logger principal
     logging.basicConfig(
-        level=logging.INFO,  # Alterado para INFO para reduzir verbosidade
+        level=logging.DEBUG,  # Changed to DEBUG to capture all logs
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
     

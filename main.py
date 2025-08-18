@@ -1,13 +1,21 @@
-from fastapi import FastAPI, Request
-import json
-import re
+from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from typing import List, Dict, Optional, Any
+from supabase import AsyncClient, create_async_client
+from config.config import SUPABASE_URL, SUPABASE_KEY, EVOLUTION_API_URL, OPENAI_API_KEY, SUPABASE_JWT_SECRET
+import jwt
+import os
+import aiohttp
 from openai import AsyncOpenAI
-from config.config import OPENAI_API_KEY, SUPABASE_URL, SUPABASE_KEY
-from supabase import AsyncClient, acreate_client
+from datetime import datetime, timedelta
 from tools.supabase_tools import get_lead, upsert_lead
 from tools.whatsapp_tools import send_whatsapp_message, send_whatsapp_audio, send_whatsapp_image, fetch_media_base64
 from tools.audio_tools import text_to_speech
 from tools.image_tools import analyze_image
+from tools.asaas_tools import create_customer, create_payment_link, get_customer_by_cpf
+from tools.klingo_tools import fetch_procedure_price 
 from tools.extract_lead_info import extract_lead_info
 from utils.image_processing import resize_image_to_thumbnail
 from models.lead_data import LeadData
@@ -15,26 +23,162 @@ from bot_agents.triage_agent import initialize_triage_agent
 from bot_agents.appointment_agent import start_appointment_reminder
 from agents import Runner
 from utils.logging_setup import setup_logging
-from datetime import datetime, timedelta
-import os
-import base64
-from tools.asaas_tools import get_customer_by_cpf, create_customer, create_payment_link
-from tools.klingo_tools import fetch_klingo_schedule, identify_klingo_patient, register_klingo_patient, fetch_procedure_price
-from typing import Dict, Optional
 import asyncio
+import re
+import json
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from openai import RateLimitError
+from uuid import UUID
+import base64
+
 
 logger = setup_logging()
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 app = FastAPI()
-threads = {}
-message_buffer = {}  # Buffer: {remoteJid: {clinic_id: {messages: [str], timestamp: datetime, message_key_id: str}}}
-BUFFER_TIMEOUT = 5  # Seconds to wait for additional messages
-MAX_MESSAGES = 3  # Maximum messages to buffer
-COMPLETE_KEYWORDS = ["consulta", "agendar", "exame", "marcar", "médico", "horário", "atendimento"]
 
-logger.info("Running main.py version with Asaas, Klingo tools, message buffering, and paragraph splitting")
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "https://your-vercel-app.vercel.app"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Log requests and responses
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    logger.info(f"Request: {request.method} {request.url}")
+    response = await call_next(request)
+    logger.info(f"Response headers: {response.headers}")
+    return response
+
+# Authentication dependency
+async def get_current_user(request: Request) -> Dict:
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    logger.debug(f"Received token: {token[:10]}... (full length: {len(token)})")
+    if not token:
+        logger.error("No token provided in Authorization header")
+        raise HTTPException(status_code=401, detail="No token provided")
+    try:
+        jwt_secret = os.getenv("SUPABASE_JWT_SECRET")
+        if not jwt_secret:
+            logger.error("SUPABASE_JWT_SECRET is not set in environment variables")
+            raise HTTPException(status_code=500, detail="Server configuration error: JWT secret missing")
+        logger.debug(f"SUPABASE_JWT_SECRET (first 10 chars): {jwt_secret[:10]}... (length: {len(jwt_secret)})")
+        payload = jwt.decode(
+            token,
+            jwt_secret,
+            algorithms=["HS256"],
+            options={"verify_aud": False, "leeway": 60}
+        )
+        logger.debug(f"Decoded JWT payload: {payload}")
+        return {"user_id": payload["sub"], "email": payload["email"]}
+    except jwt.ExpiredSignatureError as e:
+        logger.error(f"JWT expired: {str(e)}")
+        raise HTTPException(status_code=401, detail=f"Invalid token: JWT expired")
+    except jwt.InvalidSignatureError as e:
+        logger.error(f"Invalid JWT signature: {str(e)}")
+        raise HTTPException(status_code=401, detail=f"Invalid token: Invalid signature")
+    except Exception as e:
+        logger.error(f"Invalid token: {str(e)}")
+        raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
+
+# Supabase client dependency
+async def get_supabase_client() -> AsyncClient:
+    return await create_async_client(SUPABASE_URL, SUPABASE_KEY)
+
+# Pydantic models
+class ClinicProfileUpdate(BaseModel):
+    name: str
+    asaas_api_key: Optional[str]
+    klingo_api_key: Optional[str]
+    address: Optional[str]
+    recommendations: Optional[str]
+    support_phone: Optional[str]
+    asaas_enabled: bool
+    klingo_enabled: bool
+    attendance_agent_enabled: bool
+    scheduling_agent_enabled: bool
+    payment_agent_enabled: bool
+    reminder_agent_enabled: bool
+    initial_message_enabled: bool
+    offered_services_enabled: bool
+
+class AgentPromptUpdate(BaseModel):
+    id: Optional[UUID]  # Permitir id como opcional para novos prompts
+    name: str
+    prompt: str
+    variables: List[str]
+    enabled: bool
+    clinic_id: Optional[UUID] = None  # Adicionado para garantir compatibilidade
+
+class OperatingHoursUpdate(BaseModel):
+    day: str
+    enabled: bool
+    start_time: Optional[str]
+    end_time: Optional[str]
+
+class LeadUpdate(BaseModel):
+    status: str
+
+class CreateInstanceRequest(BaseModel):
+    instance_name: str
+    phone_number: str
+    type: str
+
+class ClinicCreate(BaseModel):
+    name: str
+    assistant_name: Optional[str]
+    address: Optional[str]
+    support_phone: Optional[str]
+
+# Lista de prompts padrão
+DEFAULT_PROMPTS = [
+    {
+        "name": "Attendance Agent",
+        "prompt": "Atenda o cliente {client_name} com informações sobre {service_name}.",
+        "variables": ["{client_name}", "{service_name}"],
+        "enabled": True,
+    },
+    {
+        "name": "Scheduling Agent",
+        "prompt": "Agende uma consulta para {client_name} às {appointment_time} em {appointment_date}.",
+        "variables": ["{client_name}", "{appointment_time}", "{appointment_date}"],
+        "enabled": True,
+    },
+    {
+        "name": "Payment Agent",
+        "prompt": "Processar pagamento para {client_name} pelo serviço {service_name}.",
+        "variables": ["{client_name}", "{service_name}"],
+        "enabled": False,
+    },
+    {
+        "name": "Reminder Agent",
+        "prompt": "Lembre {client_name} da consulta às {appointment_time} em {appointment_date}.",
+        "variables": ["{client_name}", "{appointment_time}", "{appointment_date}"],
+        "enabled": True,
+    },
+    {
+        "name": "Initial Message",
+        "prompt": "Bem-vindo(a) ao {clinic_name}, {client_name}! {greeting} Como posso ajudar você hoje?",
+        "variables": ["{clinic_name}", "{client_name}", "{greeting}"],
+        "enabled": True,
+    },
+    {
+        "name": "Offered Services",
+        "prompt": "Nossos serviços incluem: {service_list}. Deseja mais informações?",
+        "variables": ["{service_list}"],
+        "enabled": True,
+    },
+]
+
+# Existing thread handling
+threads = {}
+message_buffer = {}
+BUFFER_TIMEOUT = 5
+MAX_MESSAGES = 3
+COMPLETE_KEYWORDS = ["consulta", "agendar", "exame", "marcar", "médico", "horário", "atendimento"]
 
 def build_response_data(text: str, metadata: dict, intent: str = "scheduling") -> dict:
     base_metadata = {
@@ -155,7 +299,7 @@ async def flush_buffer(remote_jid: str, clinic_id: str) -> str:
         del message_buffer[remote_jid]
     return combined
 
-async def send_response(phone_number: str, user_id: str, response_data: dict, prefer_audio: bool, message_key_id: str, is_audio_message: bool, message: str) -> bool:
+async def send_response(phone_number: str, user_id: str, response_data: dict, prefer_audio: bool, message_key_id: str, is_audio_message: bool, message: str, clinic_id: str) -> bool:
     success = False
     logger.debug(f"[{user_id}] Sending response: {response_data['text']}")
     if prefer_audio and response_data.get("text"):
@@ -166,7 +310,8 @@ async def send_response(phone_number: str, user_id: str, response_data: dict, pr
                 audio_path=audio_path,
                 remotejid=user_id,
                 message_key_id=message_key_id,
-                message_text=message if not is_audio_message else None
+                message_text=message if not is_audio_message else None,
+                clinic_id=clinic_id
             )
             if os.path.exists(audio_path):
                 os.remove(audio_path)
@@ -181,7 +326,7 @@ async def send_response(phone_number: str, user_id: str, response_data: dict, pr
             paragraphs = response_data["text"].split("\n\n")
             for paragraph in paragraphs:
                 if paragraph.strip():
-                    success = await send_whatsapp_message(phone_number, paragraph.strip(), remotejid=user_id)
+                    success = await send_whatsapp_message(phone_number, paragraph.strip(), remotejid=user_id, clinic_id=clinic_id)
                     if not success:
                         logger.error(f"[{user_id}] Falha ao enviar parágrafo: {paragraph}")
                         break
@@ -199,7 +344,8 @@ async def send_response(phone_number: str, user_id: str, response_data: dict, pr
                     caption=caption,
                     remotejid=user_id,
                     message_key_id=message_key_id,
-                    message_text=message if not is_audio_message else None
+                    message_text=message if not is_audio_message else None,
+                    clinic_id=clinic_id
                 )
                 if success:
                     response_data = {"text": "", "metadata": response_data["metadata"]}
@@ -211,25 +357,417 @@ async def send_response(phone_number: str, user_id: str, response_data: dict, pr
                         intent="error"
                     )
             if response_data.get("text"):
-                # Dividir por \n\n, depois por \n, depois por pontos finais
                 if "\n\n" in response_data["text"]:
                     segments = response_data["text"].split("\n\n")
                 elif "\n" in response_data["text"]:
                     segments = response_data["text"].split("\n")
                 else:
-                    # Dividir por pontos finais (frases completas)
                     segments = re.split(r'(?<=[.!?])\s+', response_data["text"].strip())
                 for i, segment in enumerate(segments):
                     segment = segment.strip()
                     if segment:
                         logger.info(f"[{user_id}] Sending segment {i+1}/{len(segments)}: {segment}")
-                        success = await send_whatsapp_message(phone_number, segment, remotejid=user_id)
+                        success = await send_whatsapp_message(phone_number, segment, remotejid=user_id, clinic_id=clinic_id)
                         if not success:
                             logger.error(f"[{user_id}] Failed to send segment {i+1}: {segment}")
                             break
                         await asyncio.sleep(0.5)
                 success = success and True
     return success
+
+# Dashboard endpoints
+@app.get("/leads")
+async def get_leads(user: dict = Depends(get_current_user), supabase: AsyncClient = Depends(get_supabase_client)):
+    try:
+        clinic_user = await supabase.table("clinic_users").select("clinic_id").eq("user_id", user["user_id"]).execute()
+        if not clinic_user.data:
+            raise HTTPException(status_code=403, detail="User not associated with any clinic")
+        clinic_id = clinic_user.data[0]["clinic_id"]
+        response = await supabase.table("clients").select("*").eq("clinic_id", clinic_id).execute()
+        return response.data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.patch("/leads/{remotejid}")
+async def update_lead(remotejid: str, data: LeadUpdate, user: dict = Depends(get_current_user), supabase: AsyncClient = Depends(get_supabase_client)):
+    try:
+        clinic_user = await supabase.table("clinic_users").select("clinic_id").eq("user_id", user["user_id"]).execute()
+        if not clinic_user.data:
+            raise HTTPException(status_code=403, detail="User not associated with any clinic")
+        clinic_id = clinic_user.data[0]["clinic_id"]
+        response = await supabase.table("clients").update(data.dict()).eq("remotejid", remotejid).eq("clinic_id", clinic_id).execute()
+        if not response.data:
+            raise HTTPException(status_code=404, detail="Lead not found")
+        return response.data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/clinic/create")
+async def create_clinic(data: ClinicCreate, user: dict = Depends(get_current_user), supabase: AsyncClient = Depends(get_supabase_client)):
+    try:
+        # Criar a clínica
+        clinic_response = await supabase.table("clinics").insert({
+            "name": data.name,
+            "assistant_name": data.assistant_name,
+            "address": data.address,
+            "support_phone": data.support_phone,
+        }).execute()
+        if not clinic_response.data:
+            raise HTTPException(status_code=400, detail="Failed to create clinic")
+        clinic_id = clinic_response.data[0]["clinic_id"]
+
+        # Associar o usuário à clínica
+        await supabase.table("clinic_users").insert({
+            "user_id": user["user_id"],
+            "clinic_id": clinic_id,
+        }).execute()
+
+        # Inicializar prompts padrão
+        default_prompts = [
+            {
+                "clinic_id": clinic_id,
+                "name": prompt["name"],
+                "prompt": prompt["prompt"],
+                "variables": prompt["variables"],
+                "enabled": prompt["enabled"],
+            }
+            for prompt in DEFAULT_PROMPTS
+        ]
+        await supabase.table("agent_prompts").insert(default_prompts).execute()
+
+        return clinic_response.data
+    except Exception as e:
+        logger.error(f"Error creating clinic: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/clinic/profile")
+async def get_clinic_profile(user: dict = Depends(get_current_user), supabase: AsyncClient = Depends(get_supabase_client)):
+    try:
+        clinic_user = await supabase.table("clinic_users").select("clinic_id").eq("user_id", user["user_id"]).execute()
+        if not clinic_user.data:
+            raise HTTPException(status_code=403, detail="User not associated with any clinic")
+        clinic_id = clinic_user.data[0]["clinic_id"]
+        response = await supabase.table("clinics").select("*").eq("clinic_id", clinic_id).single().execute()
+        return response.data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/clinic/profile")
+async def update_clinic_profile(data: ClinicProfileUpdate, user: dict = Depends(get_current_user), supabase: AsyncClient = Depends(get_supabase_client)):
+    try:
+        clinic_user = await supabase.table("clinic_users").select("clinic_id").eq("user_id", user["user_id"]).execute()
+        if not clinic_user.data:
+            raise HTTPException(status_code=403, detail="User not associated with any clinic")
+        clinic_id = clinic_user.data[0]["clinic_id"]
+        response = await supabase.table("clinics").update(data.dict(exclude_unset=True)).eq("clinic_id", clinic_id).execute()
+        if not response.data:
+            raise HTTPException(status_code=404, detail="Clinic not found")
+        return response.data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/clinic/prompts")
+async def get_clinic_prompts(user: dict = Depends(get_current_user), supabase: AsyncClient = Depends(get_supabase_client)):
+    try:
+        clinic_user = await supabase.table("clinic_users").select("clinic_id").eq("user_id", user["user_id"]).execute()
+        if not clinic_user.data:
+            raise HTTPException(status_code=403, detail="User not associated with any clinic")
+        clinic_id = clinic_user.data[0]["clinic_id"]
+
+        # Buscar prompts existentes
+        response = await supabase.table("agent_prompts").select("*").eq("clinic_id", clinic_id).execute()
+        existing_prompts = response.data or []
+
+        # Verificar quais prompts padrão estão faltando
+        existing_prompt_names = {prompt["name"] for prompt in existing_prompts}
+        missing_prompts = [prompt for prompt in DEFAULT_PROMPTS if prompt["name"] not in existing_prompt_names]
+
+        # Criar prompts faltantes
+        if missing_prompts:
+            new_prompts = [
+                {
+                    "clinic_id": clinic_id,
+                    "name": prompt["name"],
+                    "prompt": prompt["prompt"],
+                    "variables": prompt["variables"],
+                    "enabled": prompt["enabled"],
+                }
+                for prompt in missing_prompts
+            ]
+            await supabase.table("agent_prompts").insert(new_prompts).execute()
+
+            # Buscar novamente todos os prompts após a inserção
+            response = await supabase.table("agent_prompts").select("*").eq("clinic_id", clinic_id).execute()
+
+        return response.data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/clinic/prompts")
+async def update_clinic_prompts(prompts: List[AgentPromptUpdate], user: dict = Depends(get_current_user), supabase: AsyncClient = Depends(get_supabase_client)):
+    try:
+        clinic_user = await supabase.table("clinic_users").select("clinic_id").eq("user_id", user["user_id"]).execute()
+        if not clinic_user.data:
+            raise HTTPException(status_code=403, detail="User not associated with any clinic")
+        clinic_id = clinic_user.data[0]["clinic_id"]
+
+        # Garantir que todos os prompts tenham o clinic_id correto
+        cleaned_prompts = [
+            {
+                **prompt.dict(exclude_unset=True),
+                "clinic_id": clinic_id,
+                "id": str(prompt.id) if prompt.id else None,  # Permitir que o Supabase gere UUID para novos prompts
+            }
+            for prompt in prompts
+        ]
+
+        # Realizar upsert
+        response = await supabase.table("agent_prompts").upsert(
+            cleaned_prompts,
+            on_conflict="id"
+        ).execute()
+
+        if not response.data:
+            raise HTTPException(status_code=400, detail="Failed to update prompts")
+
+        return response.data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/clinic/hours")
+async def get_operating_hours(user: dict = Depends(get_current_user), supabase: AsyncClient = Depends(get_supabase_client)):
+    try:
+        clinic_user = await supabase.table("clinic_users").select("clinic_id").eq("user_id", user["user_id"]).execute()
+        if not clinic_user.data:
+            raise HTTPException(status_code=403, detail="User not associated with any clinic")
+        clinic_id = clinic_user.data[0]["clinic_id"]
+        response = await supabase.table("operating_hours").select("*").eq("clinic_id", clinic_id).execute()
+        return response.data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/clinic/hours")
+async def update_operating_hours(hours: List[OperatingHoursUpdate], user: dict = Depends(get_current_user), supabase: AsyncClient = Depends(get_supabase_client)):
+    try:
+        clinic_user = await supabase.table("clinic_users").select("clinic_id").eq("user_id", user["user_id"]).execute()
+        if not clinic_user.data:
+            raise HTTPException(status_code=403, detail="User not associated with any clinic")
+        clinic_id = clinic_user.data[0]["clinic_id"]
+        response = await supabase.table("operating_hours").upsert(
+            [{**h.dict(), "clinic_id": clinic_id} for h in hours],
+            on_conflict="clinic_id,day"
+        ).execute()
+        return response.data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/whatsapp/instances")
+async def get_whatsapp_instances(user: dict = Depends(get_current_user), supabase: AsyncClient = Depends(get_supabase_client)):
+    try:
+        clinic_user = await supabase.table("clinic_users").select("clinic_id").eq("user_id", user["user_id"]).execute()
+        if not clinic_user.data:
+            raise HTTPException(status_code=403, detail="User not associated with any clinic")
+        clinic_id = clinic_user.data[0]["clinic_id"]
+        response = await supabase.table("clinic_instances").select("*").eq("clinic_id", clinic_id).execute()
+        return response.data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/whatsapp/instances/{instance_id}")
+async def get_whatsapp_instance(instance_id: str, user: dict = Depends(get_current_user), supabase: AsyncClient = Depends(get_supabase_client)):
+    try:
+        clinic_user = await supabase.table("clinic_users").select("clinic_id").eq("user_id", user["user_id"]).execute()
+        if not clinic_user.data:
+            raise HTTPException(status_code=403, detail="User not associated with any clinic")
+        clinic_id = clinic_user.data[0]["clinic_id"]
+        response = await supabase.table("clinic_instances").select("*").eq("id", instance_id).eq("clinic_id", clinic_id).single().execute()
+        if not response.data:
+            raise HTTPException(status_code=404, detail="Instance not found")
+        return response.data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.options("/create-instance")
+async def options_create_instance():
+    return JSONResponse(
+        status_code=200,
+        headers={
+            "Access-Control-Allow-Origin": "http://localhost:5173",
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization",
+            "Access-Control-Allow-Credentials": "true"
+        }
+    )
+
+@app.post("/create-instance")
+async def create_instance_endpoint(data: CreateInstanceRequest, user: dict = Depends(get_current_user), supabase: AsyncClient = Depends(get_supabase_client)):
+    try:
+        clinic_user = await supabase.table("clinic_users").select("clinic_id").eq("user_id", user["user_id"]).execute()
+        if not clinic_user.data:
+            raise HTTPException(status_code=403, detail="User not associated with any clinic")
+        clinic_id = clinic_user.data[0]["clinic_id"]
+        if not all([EVOLUTION_API_URL, os.getenv("EVOLUTION_ADMIN_API_KEY")]):
+            logger.error("EVOLUTION_API_URL or EVOLUTION_ADMIN_API_KEY not configured")
+            raise HTTPException(status_code=500, detail="Evolution API configuration missing")
+        
+        instance_name = data.instance_name
+        cleaned_phone_number = ''.join(filter(str.isdigit, data.phone_number))
+        whatsapp_formatted_number = f"{cleaned_phone_number}@s.whatsapp.net"
+        
+        webhook_url = os.getenv("WEBHOOK_URL")
+        if not webhook_url:
+            logger.error("WEBHOOK_URL not configured in .env")
+            raise HTTPException(status_code=500, detail="Webhook URL not configured")
+        
+        payload = {
+            "instanceName": instance_name,
+            "number": cleaned_phone_number,
+            "qrcode": True,
+            "integration": data.type,
+            "rejectCall": True,
+            "groupsIgnore": True,
+            "alwaysOnline": True,
+            "readMessages": True,
+            "webhook": {
+                "url": webhook_url,
+                "byEvents": False,
+                "base64": True,
+                "headers": {
+                    "authorization": f"Bearer {os.getenv('WEBHOOK_AUTH_TOKEN', '')}",
+                    "Content-Type": "application/json"
+                },
+                "events": ["MESSAGES_UPSERT"]
+            }
+        }
+        headers = {
+            "apikey": os.getenv("EVOLUTION_ADMIN_API_KEY"),
+            "Content-Type": "application/json"
+        }
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.post(f"{EVOLUTION_API_URL}/instance/create", json=payload) as response:
+                response_text = await response.text()
+                logger.debug(f"Instance creation response: {response.status} - {response_text}")
+                if response.status not in (200, 201):
+                    logger.error(f"Failed to create instance: {response.status} - {response_text}")
+                    raise HTTPException(status_code=500, detail=f"Failed to create instance: {response_text}")
+                response_data = await response.json()
+        
+        qr_code = response_data.get("qrcode", {}).get("base64", "")
+        logger.debug(f"QR code data: length={len(qr_code)}, starts_with_data_image={qr_code.startswith('data:image/')}")
+        
+        instance_data = {
+            "clinic_id": clinic_id,
+            "instance_name": instance_name,
+            "api_key": response_data.get("instance", {}).get("instanceName", instance_name),
+            "phone_number": data.phone_number,
+            "status": "connecting",
+            "qr_code": qr_code,
+        }
+        response = await supabase.table("clinic_instances").insert(instance_data).execute()
+        logger.info(f"Instance created for clinic {clinic_id}: {instance_name}")
+        
+        whatsapp_number_data = {
+            "phone_number": whatsapp_formatted_number,
+            "clinic_id": clinic_id
+        }
+        try:
+            await supabase.table("whatsapp_numbers").insert(whatsapp_number_data).execute()
+            logger.info(f"WhatsApp number {whatsapp_formatted_number} added for clinic {clinic_id}")
+        except Exception as e:
+            if "duplicate key value" not in str(e).lower():
+                logger.error(f"Error inserting into whatsapp_numbers: {str(e)}")
+            else:
+                logger.info(f"WhatsApp number {whatsapp_formatted_number} already exists for clinic {clinic_id}")
+        
+        return response.data[0]
+    except Exception as e:
+        logger.error(f"Error creating instance: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error creating instance: {str(e)}")
+
+@app.delete("/delete-instance/{instance_id}")
+async def delete_instance_endpoint(instance_id: str, user: dict = Depends(get_current_user), supabase: AsyncClient = Depends(get_supabase_client)):
+    try:
+        clinic_user = await supabase.table("clinic_users").select("clinic_id").eq("user_id", user["user_id"]).execute()
+        if not clinic_user.data:
+            raise HTTPException(status_code=403, detail="User not associated with any clinic")
+        clinic_id = clinic_user.data[0]["clinic_id"]
+        
+        instance = await supabase.table("clinic_instances").select("*").eq("api_key", instance_id).eq("clinic_id", clinic_id).single().execute()
+        if not instance.data:
+            raise HTTPException(status_code=404, detail="Instance not found")
+        
+        headers = {
+            "apikey": os.getenv("EVOLUTION_ADMIN_API_KEY"),
+            "Content-Type": "application/json"
+        }
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.delete(f"{EVOLUTION_API_URL}/instance/delete/{instance_id}") as response:
+                response_text = await response.text()
+                logger.debug(f"Instance deletion response: {response.status} - {response_text}")
+                if response.status not in (200, 204):
+                    logger.error(f"Failed to delete instance: {response.status} - {response_text}")
+                    raise HTTPException(status_code=500, detail=f"Failed to delete instance: {response_text}")
+        
+        await supabase.table("clinic_instances").delete().eq("api_key", instance_id).eq("clinic_id", clinic_id).execute()
+        logger.info(f"Instance {instance_id} deleted from clinic_instances")
+        
+        cleaned_phone_number = ''.join(filter(str.isdigit, instance.data["phone_number"]))
+        whatsapp_formatted_number = f"{cleaned_phone_number}@s.whatsapp.net"
+        await supabase.table("whatsapp_numbers").delete().eq("phone_number", whatsapp_formatted_number).eq("clinic_id", clinic_id).execute()
+        logger.info(f"WhatsApp number {whatsapp_formatted_number} deleted for clinic {clinic_id}")
+        
+        return {"status": "success", "message": f"Instance {instance_id} deleted successfully"}
+    except Exception as e:
+        logger.error(f"Error deleting instance: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error deleting instance: {str(e)}")
+
+@app.post("/verify-instance")
+async def verify_instance_endpoint(data: dict, user: dict = Depends(get_current_user), supabase: AsyncClient = Depends(get_supabase_client)):
+    try:
+        api_key = data.get("api_key")
+        if not api_key:
+            raise HTTPException(status_code=400, detail="api_key is required")
+        
+        clinic_user = await supabase.table("clinic_users").select("clinic_id").eq("user_id", user["user_id"]).execute()
+        if not clinic_user.data:
+            raise HTTPException(status_code=403, detail="User not associated with any clinic")
+        clinic_id = clinic_user.data[0]["clinic_id"]
+        
+        instance = await supabase.table("clinic_instances").select("*").eq("api_key", api_key).eq("clinic_id", clinic_id).single().execute()
+        if not instance.data:
+            raise HTTPException(status_code=404, detail="Instance not found")
+        
+        headers = {
+            "apikey": os.getenv("EVOLUTION_ADMIN_API_KEY"),
+            "Content-Type": "application/json"
+        }
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.get(f"{EVOLUTION_API_URL}/instance/connectionState/{api_key}") as response:
+                response_text = await response.text()
+                logger.debug(f"Instance verification response: {response.status} - {response_text}")
+                if response.status not in (200, 201):
+                    logger.error(f"Failed to verify instance: {response.status} - {response_text}")
+                    raise HTTPException(status_code=500, detail=f"Failed to verify instance: {response_text}")
+                response_data = await response.json()
+        
+        evolution_status = response_data.get("instance", {}).get("state", "disconnected")
+        status = "disconnected"
+        if evolution_status == "open":
+            status = "connected"
+        elif evolution_status == "connecting":
+            status = "connecting"
+        
+        update_data = {"status": status}
+        if status == "connected" or (instance.data.get("created_at") and 
+                                    (datetime.now() - datetime.fromisoformat(instance.data["created_at"].replace("Z", "+00:00"))).total_seconds() > 60):
+            update_data["qr_code"] = None
+        
+        await supabase.table("clinic_instances").update(update_data).eq("api_key", api_key).eq("clinic_id", clinic_id).execute()
+        
+        return {"api_key": api_key, "status": status}
+    except Exception as e:
+        logger.error(f"Error verifying instance: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error verifying instance: {str(e)}")
 
 @app.on_event("startup")
 async def startup_event():
@@ -247,7 +785,7 @@ async def webhook(request: Request):
             logger.error(f"Invalid sender number: {sender_number}")
             return {"status": "error", "message": "Invalid sender number"}
 
-        supabase_client: AsyncClient = await acreate_client(SUPABASE_URL, SUPABASE_KEY)
+        supabase_client: AsyncClient = await create_async_client(SUPABASE_URL, SUPABASE_KEY)
         response = await supabase_client.table("whatsapp_numbers").select("clinic_id").eq("phone_number", sender_number).execute()
         if not response.data:
             logger.error(f"No clinic found for phone number: {sender_number}")
@@ -311,7 +849,7 @@ async def webhook(request: Request):
                 return {"status": "success", "message": "Waiting for more messages"}
         elif message_data.get("audioMessage"):
             is_audio_message = True
-            media_result = await fetch_media_base64(message_key_id, "audio", remotejid=user_id)
+            media_result = await fetch_media_base64(message_key_id, "audio", user_id, clinic_id)
             if "error" in media_result:
                 logger.error(f"[{user_id}] Falha ao processar áudio: {media_result['error']}")
                 response_data = build_response_data(
@@ -319,7 +857,7 @@ async def webhook(request: Request):
                     metadata={"intent": "error", "phone_number": klingo_phone, "clinic_id": clinic_id},
                     intent="error"
                 )
-                success = await send_response(phone_number, user_id, response_data, prefer_audio=False, message_key_id=message_key_id, is_audio_message=True, message=None)
+                success = await send_response(phone_number, user_id, response_data, prefer_audio=False, message_key_id=message_key_id, is_audio_message=True, message=None, clinic_id=clinic_id)
                 return {"status": "success" if success else "error", "message": "Processed and responded" if success else "Failed to send response"}
             elif media_result.get("type") == "audio":
                 message = media_result["transcription"]
@@ -329,7 +867,7 @@ async def webhook(request: Request):
             is_image_message = True
             logger.info(f"[{user_id}] Buscando imagem completa via fetch_media_base64")
             try:
-                media_result = await fetch_media_base64(message_key_id, "image", remotejid=user_id)
+                media_result = await fetch_media_base64(message_key_id, "image", user_id, clinic_id)
                 if "error" in media_result:
                     logger.error(f"[{user_id}] Falha ao buscar imagem completa: {media_result['error']}")
                     response_data = build_response_data(
@@ -337,7 +875,7 @@ async def webhook(request: Request):
                         metadata={"intent": "error", "phone_number": klingo_phone, "clinic_id": clinic_id},
                         intent="error"
                     )
-                    success = await send_response(phone_number, user_id, response_data, prefer_audio=False, message_key_id=message_key_id, is_audio_message=False, message=None)
+                    success = await send_response(phone_number, user_id, response_data, prefer_audio=False, message_key_id=message_key_id, is_audio_message=False, message=None, clinic_id=clinic_id)
                     return {"status": "success" if success else "error", "message": "Processed and responded" if success else "Failed to send response"}
                 elif media_result.get("type") == "image":
                     base64_data = media_result["base64"]
@@ -352,7 +890,7 @@ async def webhook(request: Request):
                             metadata={"intent": "error", "phone_number": klingo_phone, "clinic_id": clinic_id},
                             intent="error"
                         )
-                        success = await send_response(phone_number, user_id, response_data, prefer_audio=False, message_key_id=message_key_id, is_audio_message=False, message=None)
+                        success = await send_response(phone_number, user_id, response_data, prefer_audio=False, message_key_id=message_key_id, is_audio_message=False, message=None, clinic_id=clinic_id)
                         return {"status": "success" if success else "error", "message": "Processed and responded" if success else "Failed to send response"}
                     image_description = await analyze_image(content=resized_base64, mimetype=mimetype)
                     try:
@@ -391,7 +929,7 @@ async def webhook(request: Request):
                     metadata={"intent": "error", "phone_number": klingo_phone, "clinic_id": clinic_id},
                     intent="error"
                 )
-                success = await send_response(phone_number, user_id, response_data, prefer_audio=False, message_key_id=message_key_id, is_audio_message=False, message=None)
+                success = await send_response(phone_number, user_id, response_data, prefer_audio=False, message_key_id=message_key_id, is_audio_message=False, message=None, clinic_id=clinic_id)
                 return {"status": "success" if success else "error", "message": "Processed and responded" if success else "Failed to send response"}
 
         if not message:
@@ -400,7 +938,7 @@ async def webhook(request: Request):
                 metadata={"intent": "greeting", "phone_number": klingo_phone, "clinic_id": clinic_id, "step": "greet"},
                 intent="greeting"
             )
-            success = await send_response(phone_number, user_id, response_data, prefer_audio=False, message_key_id=message_key_id, is_audio_message=False, message=None)
+            success = await send_response(phone_number, user_id, response_data, prefer_audio=False, message_key_id=message_key_id, is_audio_message=False, message=None, clinic_id=clinic_id)
             if success:
                 await client.beta.threads.messages.create(
                     thread_id=thread_id,
@@ -410,16 +948,16 @@ async def webhook(request: Request):
             return {"status": "success" if success else "error", "message": "Processed and responded" if success else "Failed to send response"}
 
         try:
-            current_date = datetime.now().strftime("%Y-%m-%d")  # Computa a data atual como string
-            logger.debug(f"[{user_id}] Computed current_date: {current_date}")  # Log para verificar o valor
+            current_date = datetime.now().strftime("%Y-%m-%d")
+            logger.debug(f"[{user_id}] Computed current_date: {current_date}")
             full_message = {
                 "message": message,
                 "phone": klingo_phone,
                 "clinic_id": clinic_id,
                 "history": thread_history,
-                "current_date": current_date  # Passa como string, igual phone e clinic_id
+                "current_date": current_date
             }
-            logger.debug(f"[{user_id}] Full message to agent: {json.dumps(full_message, ensure_ascii=False)}")  # Log do full_message
+            logger.debug(f"[{user_id}] Full message to agent: {json.dumps(full_message, ensure_ascii=False)}")
             await client.beta.threads.messages.create(
                 thread_id=thread_id,
                 role="user",
@@ -483,7 +1021,7 @@ async def webhook(request: Request):
                                     metadata={"intent": "error", "phone_number": klingo_phone, "clinic_id": clinic_id},
                                     intent="error"
                                 )
-                                success = await send_response(phone_number, user_id, response_data, prefer_audio=False, message_key_id=message_key_id, is_audio_message=False, message=None)
+                                success = await send_response(phone_number, user_id, response_data, prefer_audio=False, message_key_id=message_key_id, is_audio_message=False, message=None, clinic_id=clinic_id)
                                 return {"status": "success" if success else "error", "message": "Processed and responded" if success else "Failed to send response"}
 
                         amount = await fetch_procedure_price(
@@ -556,7 +1094,7 @@ async def webhook(request: Request):
                 intent="error"
             )
 
-        success = await send_response(phone_number, user_id, response_data, prefer_audio, message_key_id, is_audio_message, message)
+        success = await send_response(phone_number, user_id, response_data, prefer_audio, message_key_id, is_audio_message, message, clinic_id=clinic_id)
 
         try:
             if response_data.get("text"):
@@ -573,7 +1111,7 @@ async def webhook(request: Request):
                 metadata={"intent": "error", "phone_number": klingo_phone, "clinic_id": clinic_id},
                 intent="error"
             )
-            success = await send_response(phone_number, user_id, response_data, prefer_audio=False, message_key_id=message_key_id, is_audio_message=False, message=None)
+            success = await send_response(phone_number, user_id, response_data, prefer_audio=False, message_key_id=message_key_id, is_audio_message=False, message=None, clinic_id=clinic_id)
 
         if success:
             logger.info(f"[{user_id}] Mensagem enviada com sucesso, message_key_id: {message_key_id}")
