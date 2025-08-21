@@ -616,18 +616,6 @@ async def get_whatsapp_instance(instance_id: str, user: Dict = Depends(get_curre
         logger.error(f"Error fetching instance: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error fetching instance: {str(e)}")
 
-@app.options("/create-instance")
-async def options_create_instance():
-    return JSONResponse(
-        status_code=200,
-        headers={
-            "Access-Control-Allow-Origin": "https://evolution-front.6bdhzg.easypanel.host",
-            "Access-Control-Allow-Methods": "POST, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type, Authorization",
-            "Access-Control-Allow-Credentials": "true"
-        }
-    )
-
 @app.post("/create-instance")
 async def create_instance_endpoint(data: CreateInstanceRequest, user: Dict = Depends(get_current_user), supabase: AsyncClient = Depends(get_supabase_client)):
     try:
@@ -684,28 +672,27 @@ async def create_instance_endpoint(data: CreateInstanceRequest, user: Dict = Dep
                     raise HTTPException(status_code=500, detail=f"Failed to create instance: {response_text}")
                 response_data = await response.json()
         
-        # Access the first element of the response list
-        instance_data_response = response_data[0] if isinstance(response_data, list) and response_data else {}
-        qr_code = instance_data_response.get("qrcode", {}).get("base64", "")
-        hash_value = instance_data_response.get("hash", "")
+        # Access the hash.apikey field
+        hash_value = response_data.get("hash", {}).get("apikey", "")
         if not hash_value:
-            logger.error("No hash value found in Evolution API response")
-            raise HTTPException(status_code=500, detail="No hash value returned by Evolution API")
+            logger.error("No hash.apikey value found in Evolution API response")
+            raise HTTPException(status_code=500, detail="No hash.apikey value returned by Evolution API")
         
+        qr_code = response_data.get("qrcode", {}).get("base64", "")
         logger.debug(f"QR code data: length={len(qr_code)}, starts_with_data_image={qr_code.startswith('data:image/')}")
-        logger.debug(f"Hash value: {hash_value}")
+        logger.debug(f"Hash apikey: {hash_value}")
         
         instance_data = {
             "clinic_id": clinic_id,
             "instance_name": instance_name,
-            "api_key": hash_value,  # Store hash instead of instanceId
+            "api_key": hash_value,  # Store hash.apikey
             "phone_number": data.phone_number,
             "status": "connecting",
             "qr_code": qr_code,
         }
         
         response = await supabase.table("clinic_instances").insert(instance_data).execute()
-        logger.info(f"Instance created for clinic {clinic_id}: {instance_name} with hash {hash_value}")
+        logger.info(f"Instance created for clinic {clinic_id}: {instance_name} with hash.apikey {hash_value}")
         
         whatsapp_number_data = {
             "phone_number": whatsapp_formatted_number,
