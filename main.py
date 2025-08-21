@@ -747,19 +747,28 @@ async def delete_instance_endpoint(instance_name: str, user: dict = Depends(get_
 @app.post("/verify-instance")
 async def verify_instance_endpoint(data: dict, user: dict = Depends(get_current_user), supabase: AsyncClient = Depends(get_supabase_client)):
     try:
-        api_key = data.get("api_key")
-        if not api_key:
-            raise HTTPException(status_code=400, detail="api_key is required")
-        
+        identifier = data.get("api_key") or data.get("instance_name")
+        if not identifier:
+            raise HTTPException(status_code=400, detail="api_key or instance_name is required")
+
         clinic_user = await supabase.table("clinic_users").select("clinic_id").eq("user_id", user["user_id"]).execute()
         if not clinic_user.data:
             raise HTTPException(status_code=403, detail="User not associated with any clinic")
         clinic_id = clinic_user.data[0]["clinic_id"]
-        
-        instance = await supabase.table("clinic_instances").select("*").eq("api_key", api_key).eq("clinic_id", clinic_id).single().execute()
+
+        # Query by either api_key or instance_name
+        instance_query = supabase.table("clinic_instances").select("*").eq("clinic_id", clinic_id)
+        if data.get("api_key"):
+            instance_query = instance_query.eq("api_key", identifier)
+        else:
+            instance_query = instance_query.eq("instance_name", identifier)
+        instance = await instance_query.single().execute()
+
         if not instance.data:
             raise HTTPException(status_code=404, detail="Instance not found")
-        
+
+        # Use api_key (instanceId) for Evolution API call
+        api_key = instance.data["api_key"]
         headers = {
             "apikey": os.getenv("EVOLUTION_ADMIN_API_KEY"),
             "Content-Type": "application/json"
@@ -772,22 +781,23 @@ async def verify_instance_endpoint(data: dict, user: dict = Depends(get_current_
                     logger.error(f"Failed to verify instance: {response.status} - {response_text}")
                     raise HTTPException(status_code=500, detail=f"Failed to verify instance: {response_text}")
                 response_data = await response.json()
-        
+
         evolution_status = response_data.get("instance", {}).get("state", "disconnected")
         status = "disconnected"
         if evolution_status == "open":
             status = "connected"
         elif evolution_status == "connecting":
             status = "connecting"
-        
+
         update_data = {"status": status}
         if status == "connected" or (instance.data.get("created_at") and 
                                     (datetime.now() - datetime.fromisoformat(instance.data["created_at"].replace("Z", "+00:00"))).total_seconds() > 60):
             update_data["qr_code"] = None
-        
+
+        # Update using api_key to ensure consistency
         await supabase.table("clinic_instances").update(update_data).eq("api_key", api_key).eq("clinic_id", clinic_id).execute()
-        
-        return {"api_key": api_key, "status": status}
+
+        return {"api_key": api_key, "instance_name": instance.data["instance_name"], "status": status}
     except Exception as e:
         logger.error(f"Error verifying instance: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error verifying instance: {str(e)}")
