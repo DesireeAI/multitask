@@ -596,7 +596,8 @@ async def get_whatsapp_instances(user: Dict = Depends(get_current_user), supabas
         response = await supabase.table("clinic_instances").select("*").eq("clinic_id", clinic_id).execute()
         return response.data
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error fetching instances: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error fetching instances: {str(e)}")
 
 @app.get("/whatsapp/instances/{instance_id}")
 async def get_whatsapp_instance(instance_id: str, user: Dict = Depends(get_current_user), supabase: AsyncClient = Depends(get_supabase_client)):
@@ -606,13 +607,14 @@ async def get_whatsapp_instance(instance_id: str, user: Dict = Depends(get_curre
             raise HTTPException(status_code=403, detail="User not associated with any clinic")
         
         clinic_id = clinic_user.data[0]["clinic_id"]
-        response = await supabase.table("clinic_instances").select("*").eq("id", instance_id).eq("clinic_id", clinic_id).single().execute()
+        response = await supabase.table("clinic_instances").select("*").eq("instance_name", instance_id).eq("clinic_id", clinic_id).single().execute()
         if not response.data:
             raise HTTPException(status_code=404, detail="Instance not found")
         
         return response.data
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error fetching instance: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error fetching instance: {str(e)}")
 
 @app.options("/create-instance")
 async def options_create_instance():
@@ -682,20 +684,28 @@ async def create_instance_endpoint(data: CreateInstanceRequest, user: Dict = Dep
                     raise HTTPException(status_code=500, detail=f"Failed to create instance: {response_text}")
                 response_data = await response.json()
         
-        qr_code = response_data.get("qrcode", {}).get("base64", "")
+        # Access the first element of the response list
+        instance_data_response = response_data[0] if isinstance(response_data, list) and response_data else {}
+        qr_code = instance_data_response.get("qrcode", {}).get("base64", "")
+        hash_value = instance_data_response.get("hash", "")
+        if not hash_value:
+            logger.error("No hash value found in Evolution API response")
+            raise HTTPException(status_code=500, detail="No hash value returned by Evolution API")
+        
         logger.debug(f"QR code data: length={len(qr_code)}, starts_with_data_image={qr_code.startswith('data:image/')}")
+        logger.debug(f"Hash value: {hash_value}")
         
         instance_data = {
             "clinic_id": clinic_id,
             "instance_name": instance_name,
-            "api_key": response_data.get("instance", {}).get("instanceId", instance_name),  # Store instanceId
+            "api_key": hash_value,  # Store hash instead of instanceId
             "phone_number": data.phone_number,
             "status": "connecting",
             "qr_code": qr_code,
         }
         
         response = await supabase.table("clinic_instances").insert(instance_data).execute()
-        logger.info(f"Instance created for clinic {clinic_id}: {instance_name}")
+        logger.info(f"Instance created for clinic {clinic_id}: {instance_name} with hash {hash_value}")
         
         whatsapp_number_data = {
             "phone_number": whatsapp_formatted_number,
