@@ -36,30 +36,30 @@ async def _get_klingo_app_token(clinic_id: str, remotejid: str) -> str:
 
 @function_tool
 async def fetch_klingo_schedule(
-    start_date: str,
-    end_date: str,
-    especialidade: str,
-    exame: int,
-    plano: int,
+    cbos: str,
+    id_consulta: int,
+    id_convenio: int,
     clinic_id: str,
     remotejid: str,
     professional_id: Optional[str] = None
 ) -> str:
     """
-    Fetch available consultation slots from Klingo API.
+    Fetch available consultation slots from Klingo API for the next 5 days, starting tomorrow.
     Args:
-        start_date (str): Start date in YYYY-MM-DD format.
-        end_date (str): End date in YYYY-MM-DD format.
-        especialidade (str): Specialty code (e.g., '225275' for OTORRINOLARINGOLOGIA).
-        exame (int): Consultation procedure ID (e.g., 1376 for 'Consulta médica- Otorrino').
-        plano (int): Plan ID (e.g., 1 for particular).
+        cbos (str): Specialty code (e.g., '225275' for OTORRINOLARINGOLOGIA).
+        id_consulta (int): Consultation procedure ID (e.g., 1376 for 'Consulta médica- Otorrino').
+        id_convenio (int): Plan ID (e.g., 1 for particular).
         clinic_id (str): The ID of the clinic.
         remotejid (str): The WhatsApp user ID for logging.
         professional_id (str, optional): ID of the preferred doctor.
     Returns:
         str: JSON string with formatted schedule or error message.
     """
-    logger.debug(f"[{remotejid}] Calling fetch_klingo_schedule with especialidade: {especialidade}, exame: {exame}, plano: {plano}, professional_id: {professional_id}, clinic_id: {clinic_id}")
+    # Calculate start_date (tomorrow) and end_date (5 days later)
+    start_date = (datetime.now().date() + timedelta(days=1)).strftime("%Y-%m-%d")
+    end_date = (datetime.now().date() + timedelta(days=5)).strftime("%Y-%m-%d")
+
+    logger.debug(f"[{remotejid}] Calling fetch_klingo_schedule with cbos: {cbos}, exame: {id_consulta}, id_convenio: {id_convenio}, professional_id: {professional_id}, clinic_id: {clinic_id}, start_date: {start_date}, end_date: {end_date}")
     klingo_app_token = await _get_klingo_app_token(clinic_id, remotejid)
     if not klingo_app_token:
         return json.dumps({"error": "Não foi possível obter o token da API Klingo para a clínica"})
@@ -67,7 +67,7 @@ async def fetch_klingo_schedule(
     try:
         url = (
             f"https://api-externa.klingo.app/api/agenda/horarios"
-            f"?especialidade={especialidade}&exame={exame}&inicio={start_date}&fim={end_date}&plano={plano}"
+            f"?especialidade={cbos}&exame={id_consulta}&inicio={start_date}&fim={end_date}&plano={id_convenio}"
         )
         if professional_id:
             url += f"&profissional={professional_id}"
@@ -127,7 +127,7 @@ async def fetch_klingo_schedule(
         if not formatted_schedules:
             logger.warning(f"[{remotejid}] No matching schedules for professional_id: {professional_id}")
             return json.dumps({"error": "Nenhum horário disponível para o médico selecionado."})
-        
+
         if professional_id:
             dates = sorted(list(set(s["date"] for s in formatted_schedules)))[:3]
             formatted = {
@@ -169,20 +169,20 @@ async def fetch_klingo_schedule(
 async def book_klingo_appointment(
     access_token: str,
     slot_id: str,
-    doctor_id: str,
+    profissional_number: str,
     doctor_name: str,
     doctor_number: int,
     email: str = "",
     remotejid: str = None,
     clinic_id: str = None,
-    exame: int = 1376
+    id_consulta: int = 1376
 ) -> str:
     """
     Book an appointment in Klingo for a patient using the provided slot_id and access_token.
     """
-    logger.info(f"[{remotejid}] Calling book_klingo_appointment with slot_id: {slot_id}, doctor_id: {doctor_id}, clinic_id: {clinic_id}, exame: {exame}")
-    if not access_token or not slot_id or not doctor_id or not doctor_name or not doctor_number:
-        logger.error(f"[{remotejid}] Parâmetros obrigatórios ausentes: access_token={access_token}, slot_id={slot_id}, doctor_id={doctor_id}, doctor_name={doctor_name}, doctor_number={doctor_number}")
+    logger.info(f"[{remotejid}] Calling book_klingo_appointment with slot_id: {slot_id}, doctor_id: {profissional_number}, clinic_id: {clinic_id}, exame: {id_consulta}")
+    if not access_token or not slot_id or not profissional_number or not doctor_name or not doctor_number:
+        logger.error(f"[{remotejid}] Parâmetros obrigatórios ausentes: access_token={access_token}, slot_id={slot_id}, profissional_number={profissional_number}, doctor_name={doctor_name}, doctor_number={doctor_number}")
         return json.dumps({"error": "Parâmetros obrigatórios ausentes"})
 
     try:
@@ -193,7 +193,7 @@ async def book_klingo_appointment(
         return json.dumps({"error": "Formato de slot_id inválido"})
 
     payload = {
-        "procedimento": str(exame),
+        "procedimento": str(id_consulta),
         "id": slot_id,
         "email": bool(email),
         "teleatendimento": False,
@@ -563,7 +563,7 @@ async def fetch_klingo_convenios(clinic_id: str, remotejid: str) -> str:
         return json.dumps({"error": f"Erro: {str(e)}"})
 
 @function_tool
-async def fetch_klingo_consultas(clinic_id: str, remotejid: str, especialidade: str = None) -> str:
+async def fetch_klingo_consultas(clinic_id: str, remotejid: str, cbos: str = None) -> str:
     """
     Fetch available consultation procedures from Klingo API.
     """
@@ -574,8 +574,8 @@ async def fetch_klingo_consultas(clinic_id: str, remotejid: str, especialidade: 
     try:
         async with httpx.AsyncClient() as client:
             params = {}
-            if especialidade:
-                params["especialidade"] = especialidade
+            if cbos:
+                params["cbos"] = cbos
             response = await client.get(
                 "https://api-externa.klingo.app/api/agenda/consultas",
                 params=params,
@@ -597,10 +597,10 @@ async def fetch_klingo_consultas(clinic_id: str, remotejid: str, especialidade: 
         return json.dumps({"error": f"Erro: {str(e)}"})
 
 @function_tool
-async def fetch_klingo_profissionais(clinic_id: str, remotejid: str, especialidade: str = None) -> str:
+async def fetch_klingo_profissionais(clinic_id: str, remotejid: str, cbos: str = None) -> str:
     """
-    Fetch available professionals from Klingo API based on the provided clinic_id and optional especialidade.
-    The especialidade parameter should be provided by the agent when the user's desired specialty is identified.
+    Fetch available professionals from Klingo API based on the provided clinic_id and optional cbos.
+    The cbos parameter should be provided by the agent when the user's desired specialty is identified.
     Returns a JSON string containing the list of professionals.
     """
     klingo_app_token = await _get_klingo_app_token(clinic_id, remotejid)
@@ -610,8 +610,8 @@ async def fetch_klingo_profissionais(clinic_id: str, remotejid: str, especialida
     try:
         async with httpx.AsyncClient() as client:
             params = {}
-            if especialidade:
-                params["especialidade"] = especialidade
+            if cbos:
+                params["cbos"] = cbos
             response = await client.get(
                 "https://api-externa.klingo.app/api/profissionais",
                 params=params,
