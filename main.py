@@ -696,39 +696,50 @@ async def create_instance_endpoint(data: CreateInstanceRequest, user: dict = Dep
         logger.error(f"Error creating instance: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error creating instance: {str(e)}")
 
-@app.delete("/delete-instance/{instance_id}")
-async def delete_instance_endpoint(instance_id: str, user: dict = Depends(get_current_user), supabase: AsyncClient = Depends(get_supabase_client)):
+@app.delete("/delete-instance/{instance_name}")
+async def delete_instance_endpoint(instance_name: str, user: dict = Depends(get_current_user), supabase: AsyncClient = Depends(get_supabase_client)):
     try:
         clinic_user = await supabase.table("clinic_users").select("clinic_id").eq("user_id", user["user_id"]).execute()
         if not clinic_user.data:
+            logger.error(f"No clinic found for user {user['user_id']}")
             raise HTTPException(status_code=403, detail="User not associated with any clinic")
         clinic_id = clinic_user.data[0]["clinic_id"]
         
-        instance = await supabase.table("clinic_instances").select("*").eq("api_key", instance_id).eq("clinic_id", clinic_id).single().execute()
+        # Query by instance_name instead of api_key
+        instance = await supabase.table("clinic_instances").select("*").eq("instance_name", instance_name).eq("clinic_id", clinic_id).single().execute()
         if not instance.data:
+            logger.error(f"Instance not found in Supabase: {instance_name}")
             raise HTTPException(status_code=404, detail="Instance not found")
         
+        api_key = instance.data["api_key"]
         headers = {
             "apikey": os.getenv("EVOLUTION_ADMIN_API_KEY"),
             "Content-Type": "application/json"
         }
         async with aiohttp.ClientSession(headers=headers) as session:
-            async with session.delete(f"{EVOLUTION_API_URL}/instance/delete/{instance_id}") as response:
+            async with session.delete(f"{EVOLUTION_API_URL}/instance/delete/{api_key}") as response:
                 response_text = await response.text()
-                logger.debug(f"Instance deletion response: {response.status} - {response_text}")
-                if response.status not in (200, 204):
-                    logger.error(f"Failed to delete instance: {response.status} - {response_text}")
-                    raise HTTPException(status_code=500, detail=f"Failed to delete instance: {response_text}")
+                logger.debug(f"Instance deletion response: {response.status} - {response_text[:100]}...")
+                if response.status == 404:
+                    logger.warning(f"Instance {api_key} not found in Evolution API: {response_text[:100]}...")
+                    # Proceed to delete from Supabase to clean up
+                elif not response.ok:
+                    logger.error(f"Failed to delete instance: {response.status} - {response_text[:100]}...")
+                    raise HTTPException(status_code=response.status, detail=f"Failed to delete instance: {response.status} - {response_text[:100]}...")
+                content_type = response.headers.get("content-type", "")
+                if not content_type.startswith("application/json"):
+                    logger.error(f"Non-JSON response from Evolution API: {response_text[:100]}...")
+                    raise HTTPException(status_code=500, detail=f"Non-JSON response from Evolution API: {response_text[:100]}...")
         
-        await supabase.table("clinic_instances").delete().eq("api_key", instance_id).eq("clinic_id", clinic_id).execute()
-        logger.info(f"Instance {instance_id} deleted from clinic_instances")
+        await supabase.table("clinic_instances").delete().eq("instance_name", instance_name).eq("clinic_id", clinic_id).execute()
+        logger.info(f"Instance {instance_name} deleted from clinic_instances")
         
         cleaned_phone_number = ''.join(filter(str.isdigit, instance.data["phone_number"]))
         whatsapp_formatted_number = f"{cleaned_phone_number}@s.whatsapp.net"
         await supabase.table("whatsapp_numbers").delete().eq("phone_number", whatsapp_formatted_number).eq("clinic_id", clinic_id).execute()
         logger.info(f"WhatsApp number {whatsapp_formatted_number} deleted for clinic {clinic_id}")
         
-        return {"status": "success", "message": f"Instance {instance_id} deleted successfully"}
+        return {"status": "success", "message": f"Instance {instance_name} deleted successfully"}
     except Exception as e:
         logger.error(f"Error deleting instance: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error deleting instance: {str(e)}")
