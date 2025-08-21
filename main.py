@@ -750,55 +750,64 @@ async def delete_instance_endpoint(instance_id: str, user: Dict = Depends(get_cu
         logger.error(f"Error deleting instance: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error deleting instance: {str(e)}")
 
-@app.post("/verify-instance")
-async def verify_instance_endpoint(data: Dict, user: Dict = Depends(get_current_user), supabase: AsyncClient = Depends(get_supabase_client)):
+@app.get("/check-instance")
+async def check_instance_endpoint(user: Dict = Depends(get_current_user), supabase: AsyncClient = Depends(get_supabase_client)):
     try:
-        api_key = data.get("api_key")
-        if not api_key:
-            raise HTTPException(status_code=400, detail="api_key is required")
-        
         clinic_user = await supabase.table("clinic_users").select("clinic_id").eq("user_id", user["user_id"]).execute()
         if not clinic_user.data:
             raise HTTPException(status_code=403, detail="User not associated with any clinic")
         
         clinic_id = clinic_user.data[0]["clinic_id"]
-        instance = await supabase.table("clinic_instances").select("*").eq("api_key", api_key).eq("clinic_id", clinic_id).single().execute()
-        if not instance.data:
-            raise HTTPException(status_code=404, detail="Instance not found")
+        instance_resp = await supabase.table("clinic_instances").select("*").eq("clinic_id", clinic_id).execute()
+        if not instance_resp.data:
+            raise HTTPException(status_code=404, detail="No instance found for this clinic")
+        
+        instance_data = instance_resp.data[0]
+        instance_name = instance_data["instance_name"]
+        api_key = instance_data["api_key"]
+        current_status = instance_data["status"]
+        
+        if not EVOLUTION_API_URL:
+            logger.error("EVOLUTION_API_URL not configured")
+            raise HTTPException(status_code=500, detail="Evolution API URL not configured")
         
         headers = {
-            "apikey": os.getenv("EVOLUTION_ADMIN_API_KEY"),
+            "apikey": api_key,
             "Content-Type": "application/json"
         }
         
         async with aiohttp.ClientSession(headers=headers) as session:
-            async with session.get(f"{EVOLUTION_API_URL}/instance/connectionState/{api_key}") as response:
+            async with session.get(f"{EVOLUTION_API_URL}/instance/connectionState/{instance_name}") as response:
                 response_text = await response.text()
-                logger.debug(f"Instance verification response: {response.status} - {response_text}")
-                if response.status not in (200, 201):
-                    logger.error(f"Failed to verify instance: {response.status} - {response_text}")
-                    raise HTTPException(status_code=500, detail=f"Failed to verify instance: {response_text}")
+                logger.debug(f"Connection state response: {response.status} - {response_text}")
+                if response.status != 200:
+                    logger.error(f"Failed to get connection state: {response.status} - {response_text}")
+                    raise HTTPException(status_code=500, detail=f"Failed to get connection state: {response_text}")
+                
                 response_data = await response.json()
-        
-        evolution_status = response_data.get("instance", {}).get("state", "disconnected")
-        status = "disconnected"
-        if evolution_status == "open":
-            status = "connected"
-        elif evolution_status == "connecting":
-            status = "connecting"
-        
-        update_data = {"status": status}
-        if status == "connected" or (instance.data.get("created_at") and 
-                                    (datetime.now() - datetime.fromisoformat(instance.data["created_at"].replace("Z", "+00:00"))).total_seconds() > 60):
-            update_data["qr_code"] = None
-        
-        await supabase.table("clinic_instances").update(update_data).eq("api_key", api_key).eq("clinic_id", clinic_id).execute()
-        
-        return {"api_key": api_key, "status": status}
+                state = response_data.get("instance", {}).get("state", "unknown")
+                status_map = {
+                    "open": "connected",
+                    "connecting": "connecting",
+                    "close": "disconnected",
+                    "pairing": "connecting"  # Assuming pairing is part of connecting
+                }
+                new_status = status_map.get(state, "unknown")
+                
+                if new_status != current_status:
+                    await supabase.table("clinic_instances").update({"status": new_status}).eq("clinic_id", clinic_id).execute()
+                    logger.info(f"Updated status for instance {instance_name} to {new_status}")
+                
+                return {
+                    "instance_name": instance_name,
+                    "state": state,
+                    "status": new_status
+                }
+    
     except Exception as e:
-        logger.error(f"Error verifying instance: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error verifying instance: {str(e)}")
-
+        logger.error(f"Error checking instance: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error checking instance: {str(e)}")
+    
 @app.on_event("startup")
 async def startup_event():
     logger.info("Disparando tarefa de lembrete de agendamentos...")
