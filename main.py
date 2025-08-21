@@ -594,20 +594,9 @@ async def get_whatsapp_instances(user: Dict = Depends(get_current_user), supabas
         
         clinic_id = clinic_user.data[0]["clinic_id"]
         response = await supabase.table("clinic_instances").select("*").eq("clinic_id", clinic_id).execute()
-        
-        # Modify response to include instance_name as api_key for frontend compatibility
-        modified_response = [
-            {
-                "api_key": instance["instance_name"],  # Alias instance_name as api_key
-                **instance
-            }
-            for instance in response.data
-        ]
-        logger.debug(f"Fetched instances for clinic {clinic_id}: {modified_response}")
-        return modified_response
+        return response.data
     except Exception as e:
-        logger.error(f"Error fetching instances: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error fetching instances: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/whatsapp/instances/{instance_id}")
 async def get_whatsapp_instance(instance_id: str, user: Dict = Depends(get_current_user), supabase: AsyncClient = Depends(get_supabase_client)):
@@ -617,20 +606,13 @@ async def get_whatsapp_instance(instance_id: str, user: Dict = Depends(get_curre
             raise HTTPException(status_code=403, detail="User not associated with any clinic")
         
         clinic_id = clinic_user.data[0]["clinic_id"]
-        response = await supabase.table("clinic_instances").select("*").eq("instance_name", instance_id).eq("clinic_id", clinic_id).single().execute()
+        response = await supabase.table("clinic_instances").select("*").eq("id", instance_id).eq("clinic_id", clinic_id).single().execute()
         if not response.data:
             raise HTTPException(status_code=404, detail="Instance not found")
         
-        # Modify response to include instance_name as api_key for frontend compatibility
-        modified_response = {
-            "api_key": response.data["instance_name"],  # Alias instance_name as api_key
-            **response.data
-        }
-        logger.debug(f"Fetched instance for clinic {clinic_id}: {modified_response}")
-        return modified_response
+        return response.data
     except Exception as e:
-        logger.error(f"Error fetching instance: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error fetching instance: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/create-instance")
 async def create_instance_endpoint(data: CreateInstanceRequest, user: Dict = Depends(get_current_user), supabase: AsyncClient = Depends(get_supabase_client)):
