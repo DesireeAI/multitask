@@ -592,7 +592,7 @@ async def options_create_instance():
     return JSONResponse(
         status_code=200,
         headers={
-            "Access-Control-Allow-Origin": "http://localhost:5173",
+            "Access-Control-Allow-Origin": "https://evolution-front.6bdhzg.easypanel.host",
             "Access-Control-Allow-Methods": "POST, OPTIONS",
             "Access-Control-Allow-Headers": "Content-Type, Authorization",
             "Access-Control-Allow-Credentials": "true"
