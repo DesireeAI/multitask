@@ -753,16 +753,16 @@ async def delete_instance_endpoint(instance_id: str, user: Dict = Depends(get_cu
 @app.post("/verify-instance")
 async def verify_instance_endpoint(data: Dict, user: Dict = Depends(get_current_user), supabase: AsyncClient = Depends(get_supabase_client)):
     try:
-        instance_name = data.get("api_key")  # Frontend sends instance_name as api_key
-        if not instance_name:
-            raise HTTPException(status_code=400, detail="instance_name is required")
+        api_key = data.get("api_key")
+        if not api_key:
+            raise HTTPException(status_code=400, detail="api_key is required")
         
         clinic_user = await supabase.table("clinic_users").select("clinic_id").eq("user_id", user["user_id"]).execute()
         if not clinic_user.data:
             raise HTTPException(status_code=403, detail="User not associated with any clinic")
         
         clinic_id = clinic_user.data[0]["clinic_id"]
-        instance = await supabase.table("clinic_instances").select("*").eq("instance_name", instance_name).eq("clinic_id", clinic_id).single().execute()
+        instance = await supabase.table("clinic_instances").select("*").eq("api_key", api_key).eq("clinic_id", clinic_id).single().execute()
         if not instance.data:
             raise HTTPException(status_code=404, detail="Instance not found")
         
@@ -772,7 +772,7 @@ async def verify_instance_endpoint(data: Dict, user: Dict = Depends(get_current_
         }
         
         async with aiohttp.ClientSession(headers=headers) as session:
-            async with session.get(f"{EVOLUTION_API_URL}/instance/connectionState/{instance_name}") as response:
+            async with session.get(f"{EVOLUTION_API_URL}/instance/connectionState/{api_key}") as response:
                 response_text = await response.text()
                 logger.debug(f"Instance verification response: {response.status} - {response_text}")
                 if response.status not in (200, 201):
@@ -792,9 +792,9 @@ async def verify_instance_endpoint(data: Dict, user: Dict = Depends(get_current_
                                     (datetime.now() - datetime.fromisoformat(instance.data["created_at"].replace("Z", "+00:00"))).total_seconds() > 60):
             update_data["qr_code"] = None
         
-        await supabase.table("clinic_instances").update(update_data).eq("instance_name", instance_name).eq("clinic_id", clinic_id).execute()
+        await supabase.table("clinic_instances").update(update_data).eq("api_key", api_key).eq("clinic_id", clinic_id).execute()
         
-        return {"instance_name": instance_name, "status": status}
+        return {"api_key": api_key, "status": status}
     except Exception as e:
         logger.error(f"Error verifying instance: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error verifying instance: {str(e)}")
