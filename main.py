@@ -604,6 +604,7 @@ async def create_instance_endpoint(data: CreateInstanceRequest, user: dict = Dep
     try:
         clinic_user = await supabase.table("clinic_users").select("clinic_id").eq("user_id", user["user_id"]).execute()
         if not clinic_user.data:
+            logger.error(f"No clinic found for user {user['user_id']}")
             raise HTTPException(status_code=403, detail="User not associated with any clinic")
         clinic_id = clinic_user.data[0]["clinic_id"]
         if not all([EVOLUTION_API_URL, os.getenv("EVOLUTION_ADMIN_API_KEY")]):
@@ -647,10 +648,21 @@ async def create_instance_endpoint(data: CreateInstanceRequest, user: dict = Dep
             async with session.post(f"{EVOLUTION_API_URL}/instance/create", json=payload) as response:
                 response_text = await response.text()
                 logger.debug(f"Instance creation response: {response.status} - {response_text}")
-                if response.status not in (200, 201):
+                if not response.ok:
                     logger.error(f"Failed to create instance: {response.status} - {response_text}")
-                    raise HTTPException(status_code=500, detail=f"Failed to create instance: {response_text}")
+                    raise HTTPException(status_code=500, detail=f"Failed to create instance: {response.status} - {response_text[:100]}...")
+                content_type = response.headers.get("content-type", "")
+                if not content_type.startswith("application/json"):
+                    logger.error(f"Non-JSON response from Evolution API: {response_text[:100]}...")
+                    raise HTTPException(status_code=500, detail=f"Non-JSON response from Evolution API: {response_text[:100]}...")
                 response_data = await response.json()
+                logger.debug(f"Evolution API response: {json.dumps(response_data, indent=2)}")
+        
+        # Use instanceId from Evolution API response
+        api_key = response_data.get("instance", {}).get("instanceId")
+        if not api_key:
+            logger.error(f"No instanceId in Evolution API response: {json.dumps(response_data)}")
+            raise HTTPException(status_code=500, detail="No instanceId in Evolution API response")
         
         qr_code = response_data.get("qrcode", {}).get("base64", "")
         logger.debug(f"QR code data: length={len(qr_code)}, starts_with_data_image={qr_code.startswith('data:image/')}")
@@ -658,13 +670,13 @@ async def create_instance_endpoint(data: CreateInstanceRequest, user: dict = Dep
         instance_data = {
             "clinic_id": clinic_id,
             "instance_name": instance_name,
-            "api_key": response_data.get("instance", {}).get("instanceName", instance_name),
+            "api_key": api_key,  # Use instanceId
             "phone_number": data.phone_number,
             "status": "connecting",
             "qr_code": qr_code,
         }
         response = await supabase.table("clinic_instances").insert(instance_data).execute()
-        logger.info(f"Instance created for clinic {clinic_id}: {instance_name}")
+        logger.info(f"Instance created for clinic {clinic_id}: {instance_name} with api_key {api_key}")
         
         whatsapp_number_data = {
             "phone_number": whatsapp_formatted_number,
